@@ -72,6 +72,15 @@ class PIMSimulationResult:
 
 
 @dataclass
+class AblationResult:
+    """消融实验单项结果"""
+    name: str                          # 优化名称
+    time_ms: float                     # 该配置下的总时间
+    delta_ms: float = 0.0              # 相比上一项的变化
+    cumulative_speedup: float = 1.0    # 相比 baseline 的累积加速比
+
+
+@dataclass
 class GeoPIMOptimization:
     """GeoPIM 完整优化模型"""
     # 原始 GPU 时间分解
@@ -94,6 +103,9 @@ class GeoPIMOptimization:
     total_saving_ms: float = 0.0            # 总节省时间
     geopim_total_ms: float = 0.0            # GeoPIM 总时间
     speedup: float = 1.0                    # 端到端加速比
+    
+    # 消融实验结果
+    ablation_results: List[AblationResult] = field(default_factory=list)
 
 
 @dataclass 
@@ -317,6 +329,8 @@ def compute_geopim_optimization(
     pim_sampling_ms: float,
     sample_count: SampleCount,
     total_c: int = 128,
+    simulator_config: Optional[SimulatorConfig] = None,
+    actual_hit_rate: float = 0.5,
 ) -> GeoPIMOptimization:
     """
     计算完整的 GeoPIM 优化模型
@@ -324,6 +338,7 @@ def compute_geopim_optimization(
     包括:
     1. PIM-GPU 并行执行
     2. 数据传输节省 (消除中间数据)
+    3. 消融实验计算
     
     基于 Design.md 的数据流设计
     """
@@ -429,6 +444,82 @@ def compute_geopim_optimization(
     
     opt.geopim_total_ms = gpu_total_ms - opt.total_saving_ms
     opt.speedup = gpu_total_ms / opt.geopim_total_ms if opt.geopim_total_ms > 0 else 1.0
+    
+    # ========== 消融实验计算 ==========
+    # 逐层累加各项优化，展示每项优化的单独贡献
+    ablation_results = []
+    
+    # 创建时序模型用于估算不同配置下的 PIM 时间
+    cfg = simulator_config or SimulatorConfig()
+    hbm_config = HBMConfig(
+        row_hit_latency=cfg.row_hit_latency,
+        row_miss_latency=cfg.row_miss_latency,
+    )
+    timing_config = TimingConfig(
+        pim_freq_mhz=cfg.pim_freq_mhz,
+        tile_c=cfg.tile_c,
+        total_c=cfg.total_c,
+    )
+    cycle_model = CycleModel(HBMModel(hbm_config), timing_config)
+    
+    # 非 Transformer 部分的 GPU 时间 (Backbone, Gaussian Adapter 等)
+    gpu_non_transformer_ms = gpu_total_ms - transformer_module_ms
+    
+    # (1) Baseline: GPU-only
+    baseline_ms = gpu_total_ms
+    ablation_results.append(AblationResult(
+        name="Baseline (GPU)",
+        time_ms=baseline_ms,
+        delta_ms=0.0,
+        cumulative_speedup=1.0,
+    ))
+    
+    # (2) +Near-Memory Sampling: PIM 近内存采样，但无优化调度
+    # 使用低 hit rate (30%) 模拟无 Row Buffer Aware 调度的随机访问
+    pim_no_opt_ms = cycle_model.estimate_latency(
+        sample_count.total_samples,
+        cfg.num_active_banks,
+        hit_rate=0.30,
+    )
+    # 时间 = 非 Transformer GPU 时间 + PIM 采样 + GPU 后处理
+    time_2 = gpu_non_transformer_ms + pim_no_opt_ms + opt.gpu_post_process_ms
+    ablation_results.append(AblationResult(
+        name="+Near-Memory Sampling",
+        time_ms=time_2,
+        delta_ms=time_2 - baseline_ms,
+        cumulative_speedup=baseline_ms / time_2 if time_2 > 0 else 1.0,
+    ))
+    
+    # (3) +Row Buffer Aware: 使用优化调度 (实际 hit rate)
+    # PIM 采样使用实际模拟的 hit rate
+    time_3 = gpu_non_transformer_ms + pim_sampling_ms + opt.gpu_post_process_ms
+    ablation_results.append(AblationResult(
+        name="+Row Buffer Aware",
+        time_ms=time_3,
+        delta_ms=time_3 - time_2,
+        cumulative_speedup=baseline_ms / time_3 if time_3 > 0 else 1.0,
+    ))
+    
+    # (4) +PIM-GPU Parallel: 权重计算与采样并行执行
+    # 时间 = 非 Transformer GPU + max(PIM采样, GPU权重计算) + GPU后处理
+    time_4 = gpu_non_transformer_ms + opt.parallel_time_ms + opt.gpu_post_process_ms
+    ablation_results.append(AblationResult(
+        name="+PIM-GPU Parallel",
+        time_ms=time_4,
+        delta_ms=time_4 - time_3,
+        cumulative_speedup=baseline_ms / time_4 if time_4 > 0 else 1.0,
+    ))
+    
+    # (5) +Fused Aggregation: 流式聚合消除中间数据传输
+    time_5 = time_4 - opt.transfer_saving_ms
+    ablation_results.append(AblationResult(
+        name="+Fused Aggregation",
+        time_ms=time_5,
+        delta_ms=time_5 - time_4,
+        cumulative_speedup=baseline_ms / time_5 if time_5 > 0 else 1.0,
+    ))
+    
+    opt.ablation_results = ablation_results
     
     return opt
 
@@ -900,6 +991,8 @@ def run_benchmark(
         pim_sampling_ms=pim_result.estimated_ms,
         sample_count=sample_count,
         total_c=cfg.total_c,
+        simulator_config=cfg,
+        actual_hit_rate=pim_result.row_hit_rate,
     )
     
     return BenchmarkResult(
@@ -1045,6 +1138,32 @@ def print_results(result: BenchmarkResult):
     print(f"    原始 GPU:     {result.gpu_total_ms:.2f} ms")
     print(f"    GeoPIM 优化:  {gpu_non_transformer + result.pim_simulation.estimated_ms:.2f} ms")
     print(f"    加速:         {e2e_speedup:.2f}×")
+    print("-" * 120)
+    
+    # ========== 消融实验 ==========
+    print()
+    print("【消融实验】")
+    print("-" * 120)
+    print(f"{'优化配置':<30} {'时间 (ms)':<15} {'Δ (ms)':<15} {'累积加速比':<15}")
+    print("-" * 120)
+    
+    opt = result.optimization
+    for ab in opt.ablation_results:
+        delta_str = f"{ab.delta_ms:+.2f}" if ab.delta_ms != 0 else "-"
+        print(f"{ab.name:<30} {ab.time_ms:<15.2f} {delta_str:<15} {ab.cumulative_speedup:<15.2f}×")
+    
+    print("-" * 120)
+    
+    # 各优化贡献分解
+    print()
+    print("  各优化贡献分解:")
+    total_saving = result.gpu_total_ms - opt.geopim_total_ms
+    if total_saving > 0 and len(opt.ablation_results) > 1:
+        for ab in opt.ablation_results[1:]:  # 跳过 Baseline
+            # delta_ms 是负数表示节省时间
+            saving = -ab.delta_ms if ab.delta_ms < 0 else 0
+            contrib_pct = saving / total_saving * 100 if total_saving > 0 else 0
+            print(f"    {ab.name}: {saving:.2f} ms ({contrib_pct:.1f}%)")
     print("-" * 120)
     
     # ========== 敏感性分析 ==========
