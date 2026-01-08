@@ -13,21 +13,27 @@ from typing import Dict, Optional
 
 @dataclass
 class HBMConfig:
-    """HBM3 配置参数"""
+    """HBM3 配置参数
+    
+    参考: JEDEC HBM3 Specification
+    - Row buffer size: 通常 1-2KB per bank
+    - 这里使用 2KB 作为典型值
+    """
     
     # 结构参数
     num_stacks: int = 6
     channels_per_stack: int = 8
     banks_per_channel: int = 32
-    row_buffer_size: int = 2048  # 2KB per bank
+    row_buffer_size: int = 2048  # 2KB per bank (HBM3 typical)
     
-    # 延迟参数 (cycles @ 300MHz)
-    row_hit_latency: int = 4
-    row_miss_latency: int = 20
-    burst_length: int = 64  # bytes
+    # 延迟参数 (cycles @ 300MHz PIM frequency)
+    # 注: HBM3 核心频率更高 (~2GHz)，但 PIM 单元运行在较低频率
+    row_hit_latency: int = 4    # Row buffer hit: ~13ns @ 300MHz
+    row_miss_latency: int = 20  # Row buffer miss: ~67ns @ 300MHz (包括 precharge + activate)
+    burst_length: int = 64      # bytes per burst (HBM3 BL16 × 32-bit)
     
     # 带宽参数
-    internal_bandwidth_gbps: float = 8000.0  # ~8 TB/s
+    internal_bandwidth_gbps: float = 8000.0  # ~8 TB/s internal (6 stacks × 1.28 TB/s)
     
     @property
     def total_banks(self) -> int:

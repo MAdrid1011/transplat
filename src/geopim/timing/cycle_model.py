@@ -118,7 +118,7 @@ class CycleModel:
         total_samples: int,
         num_banks: int,
         row_hit_rate: float,
-        gpu_baseline_ms: float = 19.65
+        gpu_baseline_ms: float
     ) -> float:
         """
         估算相对于 GPU baseline 的加速比
@@ -127,7 +127,7 @@ class CycleModel:
             total_samples: 总采样点数
             num_banks: 活跃 bank 数
             row_hit_rate: Row buffer 命中率
-            gpu_baseline_ms: GPU baseline 延迟 (ms)
+            gpu_baseline_ms: GPU baseline 延迟 (ms) - 必须由调用方提供实测值
             
         Returns:
             加速比

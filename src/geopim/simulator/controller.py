@@ -150,9 +150,11 @@ class PIMController:
                 tile_start = tile_idx * tile_c
                 tile_end = tile_start + tile_c
                 
-                # 模拟 HBM 访问
-                x0, y0 = int(coord[0]), int(coord[1])
-                x1, y1 = min(x0 + 1, W - 1), min(y0 + 1, H - 1)
+                # 模拟 HBM 访问 (边界检查)
+                x0 = max(0, min(int(coord[0]), W - 2))
+                y0 = max(0, min(int(coord[1]), H - 2))
+                x1 = x0 + 1
+                y1 = y0 + 1
                 
                 # 计算 row (简化模型)
                 row = y0 * W // 64  # 假设每 row 64 pixels

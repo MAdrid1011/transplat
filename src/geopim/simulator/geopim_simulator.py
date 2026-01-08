@@ -164,13 +164,12 @@ class GeoPIMSimulator:
         # 平均 hit rate
         total_stats['row_hit_rate'] /= B
         
-        # 计算加速比
+        # 计算吞吐量
         total_stats['estimated_ms'] = total_stats['total_cycles'] / (self.config.pim_freq_mhz * 1e3)
         total_stats['throughput'] = total_stats['queries_processed'] * S / (total_stats['estimated_ms'] / 1000)
         
-        # GPU baseline 估算 (19.65ms for TransPlat)
-        total_stats['gpu_baseline_ms'] = 19.65
-        total_stats['speedup'] = total_stats['gpu_baseline_ms'] / total_stats['estimated_ms']
+        # 注: GPU baseline 应由调用方提供，这里不计算 speedup
+        # 避免硬编码 GPU 时间，让 benchmark 脚本根据实测值计算
         
         self._last_stats = total_stats
         
@@ -267,7 +266,8 @@ class GeoPIMSimulator:
         num_queries: int = 1024,
         num_samples: int = 512,
         num_views: int = 4,
-        row_hit_rate: float = 0.7
+        row_hit_rate: float = 0.7,
+        gpu_baseline_ms: Optional[float] = None
     ) -> Dict:
         """
         估算性能 (不实际执行)
@@ -278,6 +278,7 @@ class GeoPIMSimulator:
             num_samples: 每 query 采样点数
             num_views: View 数量
             row_hit_rate: 预估 row hit rate
+            gpu_baseline_ms: GPU baseline 时间 (可选，用于计算加速比)
             
         Returns:
             性能估算
@@ -287,7 +288,7 @@ class GeoPIMSimulator:
         # 每 tile 周期估算
         avg_fetch = (row_hit_rate * self.config.row_hit_latency + 
                      (1 - row_hit_rate) * self.config.row_miss_latency)
-        compute_cycles = 5  # bilinear + accum
+        compute_cycles = 5  # bilinear (4 cycles) + accum (1 cycle)
         tile_cycles = max(avg_fetch, compute_cycles)
         
         # 每 sample 周期
@@ -304,18 +305,19 @@ class GeoPIMSimulator:
         latency_sec = total_samples / total_throughput
         latency_ms = latency_sec * 1000
         
-        # GPU baseline
-        gpu_baseline_ms = 19.65
-        speedup = gpu_baseline_ms / latency_ms
-        
-        return {
+        result = {
             'total_samples': total_samples,
             'sample_cycles': int(sample_cycles),
             'single_bank_throughput': single_bank_throughput,
             'total_throughput': total_throughput,
             'estimated_ms': latency_ms,
-            'gpu_baseline_ms': gpu_baseline_ms,
-            'speedup': speedup,
             'row_hit_rate': row_hit_rate,
         }
+        
+        # 只有在提供了 GPU baseline 时才计算加速比
+        if gpu_baseline_ms is not None:
+            result['gpu_baseline_ms'] = gpu_baseline_ms
+            result['speedup'] = gpu_baseline_ms / latency_ms
+        
+        return result
 

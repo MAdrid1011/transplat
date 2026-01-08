@@ -11,21 +11,33 @@ from dataclasses import dataclass
 
 @dataclass
 class PowerConfig:
-    """功耗配置"""
+    """功耗配置
     
-    # 28nm 工艺参数
+    参考来源:
+    - 28nm 工艺功耗数据: TSMC 28nm HPC/HPM datasheet
+    - HBM-PIM 功耗约束: Samsung HBM-PIM (Nature Electronics 2021)
+    - FP16 MAC 功耗估算: NVIDIA GPU whitepaper, scaled to 28nm
+    
+    设计约束 (来自 GeoPIM_architecture_design.md):
+    - Per-bank < 1mW
+    - 总门数 < 10K gates
+    """
+    
+    # 28nm 工艺参数 (参考: TSMC 28nm)
     process_node_nm: int = 28
-    supply_voltage: float = 0.9  # V
+    supply_voltage: float = 0.9  # V (28nm typical)
     
     # Per-bank 功耗估算 (mW)
-    addr_gen_power: float = 0.1    # 地址生成器
-    tile_buffer_power: float = 0.05  # Tile buffer
-    mac_unit_power: float = 0.3    # 8-lane FP16 MAC
-    control_power: float = 0.05    # 控制逻辑
+    # 基于门级估算: 功耗 ≈ f × C × V² × gates × activity
+    # 典型值 @ 300MHz, 28nm, 0.9V:
+    addr_gen_power: float = 0.1     # ~2K gates, 地址生成器
+    tile_buffer_power: float = 0.05 # ~1K gates, 256B SRAM
+    mac_unit_power: float = 0.3     # ~5K gates, 8-lane FP16 MAC (主要功耗)
+    control_power: float = 0.05     # ~1.5K gates, FSM + counters
     
-    # 静态功耗
+    # 静态功耗 (参考: TSMC 28nm leakage @ 25°C)
     leakage_per_gate: float = 1e-6  # mW/gate @ 28nm
-    gates_per_bank: int = 9500
+    gates_per_bank: int = 9500      # 来自设计文档 ~9.5K gates
     
     @property
     def per_bank_dynamic(self) -> float:

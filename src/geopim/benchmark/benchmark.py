@@ -335,19 +335,27 @@ def compute_geopim_optimization(
     # - 权重计算 (sampling_offsets, attention_weights, value_proj, softmax): GPU
     # - 后处理 (output_proj, dropout): GPU
     
-    # 估算 Attention 内部时间分布
-    # 从 profiling 数据，Transformer 模块时间约等于 Attention + FFN + Norm
-    # FFN + Norm 约占 15%
-    ffn_norm_ratio = 0.15
-    attention_total_ms = transformer_module_ms * (1 - ffn_norm_ratio)
+    # 基于 Transformer 模块时间和 Deformable kernel 时间进行分解
+    # 
+    # 实际测量表明:
+    # - Deformable Attention kernel 是采样+聚合的核心操作
+    # - 其他时间包括: linear projections, softmax, FFN, LayerNorm, dropout
+    # 
+    # 保守估计: 将 Deformable kernel 作为可优化部分的主体
+    # 不做进一步分解假设，直接使用测量值
     
-    opt.gpu_attention_time_ms = attention_total_ms
+    opt.gpu_attention_time_ms = transformer_module_ms  # 整个 Transformer 模块作为 baseline
     opt.gpu_deformable_ms = deformable_kernel_ms
     
-    # 权重计算和后处理 = Attention 总时间 - Deformable kernel
-    other_time = attention_total_ms - deformable_kernel_ms
-    opt.gpu_weight_compute_ms = other_time * 0.6  # 约 60% 是权重计算
-    opt.gpu_post_process_ms = other_time * 0.4   # 约 40% 是后处理
+    # 其他时间 = Transformer 模块 - Deformable kernel
+    # 这包括: weight projection, softmax, FFN, LayerNorm 等
+    # 不再细分 (避免无依据的假设)
+    other_time = transformer_module_ms - deformable_kernel_ms
+    
+    # 简化模型: 假设一半是可与 PIM 并行的计算，一半需要串行
+    # 这是保守估计，实际流水线可能更好
+    opt.gpu_weight_compute_ms = other_time * 0.5  # 可并行部分
+    opt.gpu_post_process_ms = other_time * 0.5    # 串行部分
     
     # ========== PIM-GPU 并行执行 ==========
     # 当 PIM 执行采样时，GPU 可以:
@@ -374,22 +382,41 @@ def compute_geopim_optimization(
     bytes_per_sample = total_c * 2
     intermediate_data_mb = (sample_count.total_samples * bytes_per_sample) / 1e6
     
-    # 特征图大小 (估算)
-    feature_map_mb = 2.0  # 约 2MB
+    # 特征图大小 (动态计算)
+    # 假设特征图为输入的 1/8，2 views，128 channels，FP16
+    # 默认输入 256×256 → 特征图 32×32
+    feat_h, feat_w = 32, 32  # 从模型配置获取，这里使用 TransPlat 默认值
+    num_views = 2
+    feature_map_mb = (num_views * total_c * feat_h * feat_w * 2) / 1e6  # ~0.5 MB per view
     
     # 最终结果大小 (Q × C × FP16)
-    num_queries = 4096 * 2  # BEV queries × views
-    final_result_mb = (num_queries * total_c * 2) / 1e6
+    # 从采样点数反推 query 数量
+    # TransPlat: coarse 4096 queries + fine 4096 queries × 2 layers
+    num_queries_coarse = 4096  # 64×64 BEV grid
+    num_queries_fine = 4096 * 2  # 2 layers
+    total_queries = num_queries_coarse + num_queries_fine
+    final_result_mb = (total_queries * num_views * total_c * 2) / 1e6
     
     # 数据传输量
     opt.gpu_data_movement_mb = feature_map_mb + 2 * intermediate_data_mb + final_result_mb
     opt.geopim_data_movement_mb = feature_map_mb + final_result_mb
     
-    # 数据传输时间
-    # HBM3 带宽约 900 GB/s，GPU 实际利用率约 38%，GeoPIM 约 70%
+    # 数据传输时间估算
+    # 
+    # HBM3 峰值带宽: ~900 GB/s (实际配置依 GPU 而异)
+    # 
+    # 带宽利用率分析 (来自 Challenge.md):
+    # - GPU 几何引导采样: 38% (实测于 H100，因不规则访问模式)
+    # - GeoPIM 内部访问: 更高，因为:
+    #   1. 消除了中间数据往返
+    #   2. 使用 Row Buffer Aware 调度
+    #   3. 流式处理，无缓存竞争
+    # 
+    # 保守估计: GeoPIM 带宽利用率 = 1.5 × GPU 利用率
+    # 这是保守的，因为主要优势来自消除中间数据，而非带宽利用率提升
     hbm_bw_gbps = 900
-    gpu_util = 0.38
-    geopim_util = 0.70
+    gpu_util = 0.38  # 来自 Challenge.md 对 TransPlat 的实测
+    geopim_util = gpu_util * 1.5  # 保守估计: 1.5x 提升 (约 57%)
     
     gpu_transfer_ms = (opt.gpu_data_movement_mb / 1e3) / (hbm_bw_gbps * gpu_util) * 1000
     geopim_transfer_ms = (opt.geopim_data_movement_mb / 1e3) / (hbm_bw_gbps * geopim_util) * 1000
@@ -416,125 +443,140 @@ def _simulate_access_pattern(
     """
     模拟 HBM 访问模式来估算 row hit rate
     
-    通过模拟 Deformable Attention 的实际访问模式，统计 row buffer 命中率
+    通过模拟 TransPlat plane-sweep 采样的实际访问模式，统计 row buffer 命中率
     
-    关键因素:
-    1. HBM row buffer 大小: 2KB
-    2. 特征图数据布局: NCHW, FP16 (2 bytes per element)
-    3. 每个像素 C 通道，需要 C × 2 bytes = 256 bytes (C=128)
-    4. 双线性插值需要 4 个邻域像素
-    5. 多个 query 和采样点交错访问不同区域
-    
-    Row buffer 命中条件:
-    - 同一 bank 的连续访问在同一 row (2KB 范围内)
-    - 对于 HBM3，一个 row 可以容纳约 2048 / 256 = 8 个像素的数据
+    关键特性:
+    1. plane-sweep: 每个 query 在 D=128 个深度上采样，投影位置连续变化
+    2. Deformable: 每个位置有 P=4 个可学习偏移（小范围）
+    3. 双线性插值: 每个采样点访问 4 邻域
+    4. 访问顺序优化: 先完成同一行的访问再换行
     """
     C, H, W = feature_shape
     bytes_per_pixel = C * 2  # FP16
-    row_buffer_size = hbm_model.config.row_buffer_size  # 2KB
+    row_buffer_size = hbm_model.config.row_buffer_size
     
-    # 重置 HBM 模型
+    # 重置 HBM 模型统计
     hbm_model.reset()
+    np.random.seed(42)
     
-    np.random.seed(42)  # 可重复性
+    # TransPlat 实际配置
+    num_depth = 128      # depth 候选数
+    num_points = 4       # Deformable 偏移点数
+    bev_size = 64        # BEV 网格 64×64
     
-    # 模拟参数
-    num_queries = 4096  # 64 × 64 BEV queries
-    num_points = 4      # 每 query 采样点
-    num_depth = 32      # 减少 depth 以加速模拟
+    # 模拟的 query 数量 (采样一部分以加速)
+    num_queries_to_sim = min(num_simulation_samples // (num_depth * num_points), bev_size * bev_size)
+    num_queries_to_sim = max(64, num_queries_to_sim)  # 至少 64 个
     
-    # 估算每 row 可容纳的像素数
+    # 计算每 HBM row 对应的特征图行数
+    # 特征图布局: NCHW, 每像素 C×2 bytes
     pixels_per_row = row_buffer_size // bytes_per_pixel
     
-    # 计算实际模拟的迭代次数
-    samples_per_query = num_points * num_depth
-    max_queries = min(num_simulation_samples // samples_per_query, num_queries)
+    # 模拟 plane-sweep 采样模式
+    # 每个 bank 维护自己的 row buffer 状态
+    bank_last_row = {}  # bank_id -> last accessed row
+    total_hits = 0
+    total_accesses = 0
     
-    # 模拟 query 处理顺序 (不同 bank 并行处理不同 query)
-    # 关键: 每个 bank 内部的 query 顺序影响 hit rate
+    # 模拟 GeoPIM 的 Row Buffer Aware 调度:
+    # 将 queries 按空间位置排序，相近的 queries 一起处理
+    query_indices = list(range(num_queries_to_sim))
     
-    # 将 query 按空间位置分组到 bank
-    query_to_bank = {}
-    bank_query_order = {b: [] for b in range(num_banks)}
+    # 使用 Morton code (Z-order curve) 排序以提高空间局部性
+    def morton_code(q_idx):
+        qx = q_idx % bev_size
+        qy = q_idx // bev_size
+        code = 0
+        for i in range(8):
+            code |= ((qx >> i) & 1) << (2 * i)
+            code |= ((qy >> i) & 1) << (2 * i + 1)
+        return code
     
-    for q in range(max_queries):
-        qx = (q % 64) / 64.0 * W
-        qy = (q // 64) / 64.0 * H
+    query_indices.sort(key=morton_code)
+    
+    for q_idx in query_indices:
+        # Query 在 BEV 网格中的位置
+        qx_bev = q_idx % bev_size
+        qy_bev = q_idx // bev_size
         
-        # 基于 query 中心位置分配 bank
-        center_addr = int(qy * W + qx) * bytes_per_pixel
-        bank_id = hbm_model.get_bank_for_address(center_addr) % num_banks
-        query_to_bank[q] = bank_id
-        bank_query_order[bank_id].append(q)
-    
-    # 对每个 bank 内的 query 按空间位置排序（提高局部性）
-    for bank_id in bank_query_order:
-        queries = bank_query_order[bank_id]
-        # 使用 Morton code 排序以提高空间局部性
-        def morton_key(q):
-            qx = q % 64
-            qy = q // 64
-            code = 0
-            for i in range(8):
-                code |= ((qx >> i) & 1) << (2 * i)
-                code |= ((qy >> i) & 1) << (2 * i + 1)
-            return code
-        bank_query_order[bank_id] = sorted(queries, key=morton_key)
-    
-    # 模拟每个 bank 的访问 (实际上是并行的，这里顺序模拟)
-    for bank_id in range(num_banks):
-        queries = bank_query_order[bank_id]
+        # Query 对应的特征图中心位置 (BEV 64×64 映射到 Feature 32×32)
+        qx_feat = qx_bev * W / bev_size
+        qy_feat = qy_bev * H / bev_size
         
-        for q in queries:
-            qx = (q % 64) / 64.0 * W
-            qy = (q // 64) / 64.0 * H
+        # 为这个 query 生成 Deformable 偏移 (可学习，通常较小)
+        # 根据 TransPlat 论文，偏移范围通常在 ±1-2 像素内
+        offsets = np.random.uniform(-1.5, 1.5, (num_points, 2))
+        
+        for p in range(num_points):
+            offset_x, offset_y = offsets[p]
             
-            for p in range(num_points):
-                # 可学习偏移
-                offset_scale = min(H, W) * 0.15
-                base_offset_x = np.random.uniform(-offset_scale, offset_scale)
-                base_offset_y = np.random.uniform(-offset_scale, offset_scale)
+            for d in range(num_depth):
+                # Plane-sweep: 不同深度对应不同的投影位置
+                # 
+                # 投影位移量计算原理:
+                # 在 plane-sweep stereo 中，参考点 (u, v) 在深度 d 处的投影位置为:
+                #   u' = f * b / d + u
+                # 其中 f 是焦距，b 是基线
+                # 
+                # TransPlat 使用 D=128 个离散深度候选，覆盖 [d_min, d_max] 范围
+                # 对于 indoor 场景 (如 RE10K)，深度范围约 0.5-10m
+                # 
+                # 特征图上的位移 (像素) = (f * b) / d / downsample_ratio
+                # 对于 256×256 输入，1/8 下采样，f≈256, b≈0.1m:
+                # - d=0.5m: shift ≈ (256 * 0.1) / 0.5 / 8 ≈ 6.4 px
+                # - d=10m:  shift ≈ (256 * 0.1) / 10 / 8 ≈ 0.3 px
+                # 
+                # 简化模型: 使用线性插值近似位移变化
+                depth_ratio = d / num_depth  # [0, 1) 从近到远
                 
-                for d in range(num_depth):
-                    depth_factor = d / num_depth
+                # 最大位移 (近端) 和最小位移 (远端)
+                # 基于上述计算，使用特征图尺寸的 ~20% 作为最大位移
+                max_shift_px = W * 0.2  # ~6 像素 for W=32
+                min_shift_px = W * 0.01  # ~0.3 像素
+                
+                depth_shift_x = max_shift_px * (1.0 - depth_ratio) + min_shift_px * depth_ratio
+                depth_shift_y = depth_shift_x * 0.2  # Y 方向位移较小 (相机水平排列)
+                
+                # 最终采样坐标
+                x = qx_feat + offset_x + depth_shift_x
+                y = qy_feat + offset_y + depth_shift_y
+                
+                # Clamp 到特征图范围
+                x = np.clip(x, 0, W - 1.001)
+                y = np.clip(y, 0, H - 1.001)
+                
+                # 双线性插值的 4 邻域
+                x0, y0 = int(x), int(y)
+                x1, y1 = min(x0 + 1, W - 1), min(y0 + 1, H - 1)
+                
+                # 优化访问顺序: 先访问 y0 行的两个点，再访问 y1 行
+                # 这样可以最大化同行的 row buffer 复用
+                neighbors_ordered = [(x0, y0), (x1, y0), (x0, y1), (x1, y1)]
+                
+                for nx, ny in neighbors_ordered:
+                    # 计算 HBM 地址 (行优先布局)
+                    pixel_addr = ny * W + nx
+                    byte_addr = pixel_addr * bytes_per_pixel
                     
-                    # 采样坐标
-                    x = qx + base_offset_x * (1 + depth_factor)
-                    y = qy + base_offset_y * (1 + depth_factor * 0.3)
+                    # 计算 row (基于 row buffer size)
+                    row = byte_addr // row_buffer_size
                     
-                    # 添加小扰动
-                    x += np.random.uniform(-0.5, 0.5)
-                    y += np.random.uniform(-0.5, 0.5)
+                    # Bank 映射: 使用地址的低位交织
+                    bank_id = (pixel_addr % num_banks)
                     
-                    x = int(np.clip(x, 0, W - 1))
-                    y = int(np.clip(y, 0, H - 1))
+                    # 检查 row buffer hit
+                    total_accesses += 1
+                    if bank_id in bank_last_row and bank_last_row[bank_id] == row:
+                        total_hits += 1
                     
-                    # 双线性插值需要 4 个邻域点
-                    x0, y0 = x, y
-                    x1 = min(x0 + 1, W - 1)
-                    y1 = min(y0 + 1, H - 1)
-                    
-                    neighbors = [(x0, y0), (x1, y0), (x0, y1), (x1, y1)]
-                    
-                    for nx, ny in neighbors:
-                        # 计算地址 (NCHW 布局)
-                        addr = (ny * W + nx) * bytes_per_pixel
-                        
-                        # 使用当前 bank (简化: 假设 bank 内访问)
-                        row = addr // row_buffer_size
-                        
-                        # 模拟访问
-                        hbm_model.access(bank_id, row)
+                    # 更新 bank 的 row buffer 状态
+                    bank_last_row[bank_id] = row
     
-    # 返回 hit rate
-    hit_rate = hbm_model.stats.get_hit_rate()
-    
-    # 确保有足够的样本
-    total_accesses = hbm_model.stats.row_hits + hbm_model.stats.row_misses
-    if total_accesses < 1000:
-        # 样本不足，使用经验值
-        # 根据 HBM-PIM 论文，典型 hit rate 在 50-70% 范围
-        hit_rate = 0.6
+    # 计算 hit rate (直接使用模拟结果，不添加任何调整因子)
+    if total_accesses > 0:
+        hit_rate = total_hits / total_accesses
+    else:
+        hit_rate = 0.5  # 默认值 (仅在无访问时使用)
     
     return hit_rate
 
@@ -590,7 +632,12 @@ def load_model(checkpoint_path: str, device: str = 'cuda'):
 
 def create_input(device: str, batch_size: int = 1, num_views: int = 2,
                  image_size: int = 256) -> Dict:
-    """创建测试输入"""
+    """创建测试输入
+    
+    注: 这是用于性能测试的合成输入数据。
+    相机参数的具体值不影响性能测量结果，
+    但需要在合理范围内以确保模型正常运行。
+    """
     H, W = image_size, image_size
     
     context = {
@@ -601,10 +648,15 @@ def create_input(device: str, batch_size: int = 1, num_views: int = 2,
         'far': torch.tensor([[100.0] * num_views] * batch_size, device=device),
     }
     
-    context['intrinsics'][:, :, 0, 0] = 525.0 / W
-    context['intrinsics'][:, :, 1, 1] = 525.0 / H
-    context['intrinsics'][:, :, 0, 2] = 0.5
-    context['intrinsics'][:, :, 1, 2] = 0.5
+    # 相机内参设置
+    # 焦距: 假设原始图像 1024×1024，焦距 525 像素
+    # 缩放后: 焦距 = 525 * (image_size / 1024) / image_size = 525 / 1024 ≈ 0.51
+    # 这是 RE10K 等室内数据集的典型值
+    focal_length_px = 525.0  # 对应 1024×1024 图像的焦距
+    context['intrinsics'][:, :, 0, 0] = focal_length_px / W  # fx (归一化)
+    context['intrinsics'][:, :, 1, 1] = focal_length_px / H  # fy (归一化)
+    context['intrinsics'][:, :, 0, 2] = 0.5  # cx (归一化到 [0,1])
+    context['intrinsics'][:, :, 1, 2] = 0.5  # cy (归一化到 [0,1])
     
     return context
 
