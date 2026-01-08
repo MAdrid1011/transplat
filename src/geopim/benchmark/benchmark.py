@@ -330,7 +330,6 @@ def compute_geopim_optimization(
     sample_count: SampleCount,
     total_c: int = 128,
     simulator_config: Optional[SimulatorConfig] = None,
-    actual_hit_rate: float = 0.5,
 ) -> GeoPIMOptimization:
     """
     计算完整的 GeoPIM 优化模型
@@ -989,7 +988,6 @@ def run_benchmark(
         sample_count=sample_count,
         total_c=cfg.total_c,
         simulator_config=cfg,
-        actual_hit_rate=pim_result.row_hit_rate,
     )
     
     return BenchmarkResult(
@@ -1159,12 +1157,13 @@ def print_results(result: BenchmarkResult):
     print("    PGP  = PIM-GPU Parallel (权重计算与采样并行)")
     print()
     
-    # 提取各配置的数据
-    baseline = opt.ablation_results[0].time_ms
-    time_ganm = opt.ablation_results[1].time_ms if len(opt.ablation_results) > 1 else baseline
-    time_fa = opt.ablation_results[2].time_ms if len(opt.ablation_results) > 2 else baseline
-    time_ganm_fa = opt.ablation_results[3].time_ms if len(opt.ablation_results) > 3 else baseline
-    time_all = opt.ablation_results[4].time_ms if len(opt.ablation_results) > 4 else baseline
+    # 提取各配置的数据 (使用字典访问更健壮)
+    ablation_dict = {ab.name: ab.time_ms for ab in opt.ablation_results}
+    baseline = ablation_dict.get("Baseline", result.gpu_total_ms)
+    time_ganm = ablation_dict.get("+GANM", baseline)
+    time_fa = ablation_dict.get("+FA", baseline)
+    time_ganm_fa = ablation_dict.get("+GANM+FA", baseline)
+    time_all = ablation_dict.get("+GANM+FA+PGP", baseline)
     
     # 单独贡献 (正数表示节省)
     ganm_saving = baseline - time_ganm
