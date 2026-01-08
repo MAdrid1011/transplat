@@ -72,6 +72,15 @@ class PIMSimulationResult:
 
 
 @dataclass
+class AblationResult:
+    """消融实验单项结果"""
+    name: str                          # 优化名称
+    time_ms: float                     # 该配置下的总时间
+    delta_ms: float = 0.0              # 相比上一项的变化
+    cumulative_speedup: float = 1.0    # 相比 baseline 的累积加速比
+
+
+@dataclass
 class GeoPIMOptimization:
     """GeoPIM 完整优化模型"""
     # 原始 GPU 时间分解
@@ -94,6 +103,9 @@ class GeoPIMOptimization:
     total_saving_ms: float = 0.0            # 总节省时间
     geopim_total_ms: float = 0.0            # GeoPIM 总时间
     speedup: float = 1.0                    # 端到端加速比
+    
+    # 消融实验结果
+    ablation_results: List[AblationResult] = field(default_factory=list)
 
 
 @dataclass 
@@ -317,6 +329,7 @@ def compute_geopim_optimization(
     pim_sampling_ms: float,
     sample_count: SampleCount,
     total_c: int = 128,
+    simulator_config: Optional[SimulatorConfig] = None,
 ) -> GeoPIMOptimization:
     """
     计算完整的 GeoPIM 优化模型
@@ -324,6 +337,7 @@ def compute_geopim_optimization(
     包括:
     1. PIM-GPU 并行执行
     2. 数据传输节省 (消除中间数据)
+    3. 消融实验计算
     
     基于 Design.md 的数据流设计
     """
@@ -429,6 +443,79 @@ def compute_geopim_optimization(
     
     opt.geopim_total_ms = gpu_total_ms - opt.total_saving_ms
     opt.speedup = gpu_total_ms / opt.geopim_total_ms if opt.geopim_total_ms > 0 else 1.0
+    
+    # ========== 消融实验计算 ==========
+    # 消融实验设计:
+    # - GANM (Geometry-Aware Near-Memory): 核心优化1 - 几何感知的近内存采样
+    # - FA (Fused Aggregation): 核心优化2 - 流式聚合消除中间数据
+    # - PGP (PIM-GPU Parallel): 辅助优化 - 权重计算与采样并行
+    #
+    # 实验配置: Baseline, +GANM, +FA, +GANM+FA, +GANM+FA+PGP
+    ablation_results = []
+    
+    # 非 Transformer 部分的 GPU 时间 (Backbone, Gaussian Adapter 等)
+    gpu_non_transformer_ms = gpu_total_ms - transformer_module_ms
+    
+    # Transformer 模块除 Deformable 采样外的其他 GPU 时间 (权重计算 + 后处理)
+    gpu_other_transformer_ms = opt.gpu_weight_compute_ms + opt.gpu_post_process_ms
+    
+    # (1) Baseline: GPU-only
+    baseline_ms = gpu_total_ms
+    ablation_results.append(AblationResult(
+        name="Baseline",
+        time_ms=baseline_ms,
+        delta_ms=0.0,
+        cumulative_speedup=1.0,
+    ))
+    
+    # (2) +GANM: Geometry-Aware Near-Memory (核心优化1)
+    # 使用 PIM 近内存采样 + Row Buffer Aware 调度（作为整体）
+    # 时间 = 非 Transformer GPU + PIM 采样 + GPU 其他 Transformer 操作 (串行)
+    time_ganm = gpu_non_transformer_ms + pim_sampling_ms + gpu_other_transformer_ms
+    delta_ganm = time_ganm - baseline_ms
+    ablation_results.append(AblationResult(
+        name="+GANM",
+        time_ms=time_ganm,
+        delta_ms=delta_ganm,
+        cumulative_speedup=baseline_ms / time_ganm if time_ganm > 0 else 1.0,
+    ))
+    
+    # (3) +FA: Fused Aggregation (核心优化2，单独测试)
+    # 仅优化数据传输（消除中间数据），采样仍在 GPU
+    # 时间 = Baseline - 传输节省
+    time_fa = baseline_ms - opt.transfer_saving_ms
+    delta_fa = time_fa - baseline_ms
+    ablation_results.append(AblationResult(
+        name="+FA",
+        time_ms=time_fa,
+        delta_ms=delta_fa,
+        cumulative_speedup=baseline_ms / time_fa if time_fa > 0 else 1.0,
+    ))
+    
+    # (4) +GANM+FA: 两个核心优化组合
+    # 时间 = GANM 时间 - 传输节省
+    time_ganm_fa = time_ganm - opt.transfer_saving_ms
+    delta_ganm_fa = time_ganm_fa - baseline_ms
+    ablation_results.append(AblationResult(
+        name="+GANM+FA",
+        time_ms=time_ganm_fa,
+        delta_ms=delta_ganm_fa,
+        cumulative_speedup=baseline_ms / time_ganm_fa if time_ganm_fa > 0 else 1.0,
+    ))
+    
+    # (5) +GANM+FA+PGP: 全部优化 (PIM-GPU Parallel)
+    # PIM 采样与 GPU 权重计算并行，后处理串行，消除中间数据
+    # 时间 = 非 Transformer GPU + max(PIM采样, GPU权重计算) + GPU后处理 - 传输节省
+    time_all = gpu_non_transformer_ms + opt.parallel_time_ms + opt.gpu_post_process_ms - opt.transfer_saving_ms
+    delta_all = time_all - baseline_ms
+    ablation_results.append(AblationResult(
+        name="+GANM+FA+PGP",
+        time_ms=time_all,
+        delta_ms=delta_all,
+        cumulative_speedup=baseline_ms / time_all if time_all > 0 else 1.0,
+    ))
+    
+    opt.ablation_results = ablation_results
     
     return opt
 
@@ -900,6 +987,7 @@ def run_benchmark(
         pim_sampling_ms=pim_result.estimated_ms,
         sample_count=sample_count,
         total_c=cfg.total_c,
+        simulator_config=cfg,
     )
     
     return BenchmarkResult(
@@ -1045,6 +1133,56 @@ def print_results(result: BenchmarkResult):
     print(f"    原始 GPU:     {result.gpu_total_ms:.2f} ms")
     print(f"    GeoPIM 优化:  {gpu_non_transformer + result.pim_simulation.estimated_ms:.2f} ms")
     print(f"    加速:         {e2e_speedup:.2f}×")
+    print("-" * 120)
+    
+    # ========== 消融实验 ==========
+    print()
+    print("【消融实验】")
+    print("-" * 120)
+    print(f"{'优化配置':<30} {'时间 (ms)':<15} {'Δ (ms)':<15} {'累积加速比':<15}")
+    print("-" * 120)
+    
+    opt = result.optimization
+    for ab in opt.ablation_results:
+        delta_str = f"{ab.delta_ms:+.2f}" if ab.delta_ms != 0 else "-"
+        print(f"{ab.name:<30} {ab.time_ms:<15.2f} {delta_str:<15} {ab.cumulative_speedup:<15.2f}×")
+    
+    print("-" * 120)
+    
+    # 优化贡献分析
+    print()
+    print("  优化说明:")
+    print("    GANM = Geometry-Aware Near-Memory (几何感知的近内存采样)")
+    print("    FA   = Fused Aggregation (流式聚合消除中间数据)")
+    print("    PGP  = PIM-GPU Parallel (权重计算与采样并行)")
+    print()
+    
+    # 提取各配置的数据 (使用字典访问更健壮)
+    ablation_dict = {ab.name: ab.time_ms for ab in opt.ablation_results}
+    baseline = ablation_dict.get("Baseline", result.gpu_total_ms)
+    time_ganm = ablation_dict.get("+GANM", baseline)
+    time_fa = ablation_dict.get("+FA", baseline)
+    time_ganm_fa = ablation_dict.get("+GANM+FA", baseline)
+    time_all = ablation_dict.get("+GANM+FA+PGP", baseline)
+    
+    # 单独贡献 (正数表示节省)
+    ganm_saving = baseline - time_ganm
+    fa_saving = baseline - time_fa
+    
+    print("  单独贡献 (相比 Baseline):")
+    print(f"    GANM: 节省 {ganm_saving:.2f} ms ({ganm_saving/baseline*100:.1f}%)")
+    print(f"    FA:   节省 {fa_saving:.2f} ms ({fa_saving/baseline*100:.1f}%)")
+    print()
+    
+    # 组合效果 (正数表示节省)
+    ganm_fa_saving = baseline - time_ganm_fa
+    all_saving = baseline - time_all
+    pgp_additional = time_ganm_fa - time_all  # PGP 额外贡献
+    
+    print("  组合效果:")
+    print(f"    GANM+FA:     节省 {ganm_fa_saving:.2f} ms ({ganm_fa_saving/baseline*100:.1f}%)")
+    print(f"    GANM+FA+PGP: 节省 {all_saving:.2f} ms ({all_saving/baseline*100:.1f}%)")
+    print(f"    (PGP 额外贡献: {pgp_additional:.2f} ms)")
     print("-" * 120)
     
     # ========== 敏感性分析 ==========
