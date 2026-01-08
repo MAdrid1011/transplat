@@ -1,0 +1,5 @@
+project:
+  name: transplat
+  lang: python
+git:
+  default_branch: main

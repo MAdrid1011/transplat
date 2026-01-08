@@ -1,0 +1,15 @@
+[project]
+name = "transplat"
+version = "1.0.0"
+description = "TransPlat: Generalizable 3D Gaussian Splatting with GeoPIM acceleration"
+requires-python = ">=3.8"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]
+addopts = "-v"
+
+[tool.setuptools]
+packages = ["geopim"]
+package-dir = {"" = "src"}
+
