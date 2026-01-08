@@ -71,6 +71,31 @@ class PIMSimulationResult:
     active_banks: int = 0
 
 
+@dataclass
+class GeoPIMOptimization:
+    """GeoPIM 完整优化模型"""
+    # 原始 GPU 时间分解
+    gpu_attention_time_ms: float = 0.0      # Attention 模块总时间
+    gpu_deformable_ms: float = 0.0          # Deformable kernel 时间
+    gpu_weight_compute_ms: float = 0.0      # 权重计算时间 (proj, softmax)
+    gpu_post_process_ms: float = 0.0        # 后处理时间
+    
+    # PIM-GPU 并行执行
+    pim_sampling_ms: float = 0.0            # PIM 采样时间
+    parallel_time_ms: float = 0.0           # max(PIM采样, GPU权重计算)
+    geopim_attention_ms: float = 0.0        # GeoPIM Attention 时间
+    
+    # 数据传输优化
+    gpu_data_movement_mb: float = 0.0       # 原始 GPU 数据传输量
+    geopim_data_movement_mb: float = 0.0    # GeoPIM 数据传输量
+    transfer_saving_ms: float = 0.0         # 传输节省时间
+    
+    # 最终结果
+    total_saving_ms: float = 0.0            # 总节省时间
+    geopim_total_ms: float = 0.0            # GeoPIM 总时间
+    speedup: float = 1.0                    # 端到端加速比
+
+
 @dataclass 
 class BenchmarkResult:
     """基准测试结果"""
@@ -86,6 +111,8 @@ class BenchmarkResult:
     sample_count: SampleCount = field(default_factory=SampleCount)
     # 模拟器配置
     simulator_config: Optional[SimulatorConfig] = None
+    # 完整优化模型
+    optimization: GeoPIMOptimization = field(default_factory=GeoPIMOptimization)
 
 
 # ============================================================================
@@ -281,6 +308,102 @@ def run_geopim_simulation(
         total_bytes=total_bytes,
         active_banks=config.num_active_banks,
     )
+
+
+def compute_geopim_optimization(
+    gpu_total_ms: float,
+    transformer_module_ms: float,
+    deformable_kernel_ms: float,
+    pim_sampling_ms: float,
+    sample_count: SampleCount,
+    total_c: int = 128,
+) -> GeoPIMOptimization:
+    """
+    计算完整的 GeoPIM 优化模型
+    
+    包括:
+    1. PIM-GPU 并行执行
+    2. 数据传输节省 (消除中间数据)
+    
+    基于 Design.md 的数据流设计
+    """
+    opt = GeoPIMOptimization()
+    
+    # ========== 时间分解 ==========
+    # Attention 模块包含:
+    # - Deformable kernel (采样-聚合): 可 PIM 优化
+    # - 权重计算 (sampling_offsets, attention_weights, value_proj, softmax): GPU
+    # - 后处理 (output_proj, dropout): GPU
+    
+    # 估算 Attention 内部时间分布
+    # 从 profiling 数据，Transformer 模块时间约等于 Attention + FFN + Norm
+    # FFN + Norm 约占 15%
+    ffn_norm_ratio = 0.15
+    attention_total_ms = transformer_module_ms * (1 - ffn_norm_ratio)
+    
+    opt.gpu_attention_time_ms = attention_total_ms
+    opt.gpu_deformable_ms = deformable_kernel_ms
+    
+    # 权重计算和后处理 = Attention 总时间 - Deformable kernel
+    other_time = attention_total_ms - deformable_kernel_ms
+    opt.gpu_weight_compute_ms = other_time * 0.6  # 约 60% 是权重计算
+    opt.gpu_post_process_ms = other_time * 0.4   # 约 40% 是后处理
+    
+    # ========== PIM-GPU 并行执行 ==========
+    # 当 PIM 执行采样时，GPU 可以:
+    # 1. 预计算下一层的权重
+    # 2. 执行其他非依赖计算
+    
+    opt.pim_sampling_ms = pim_sampling_ms
+    opt.parallel_time_ms = max(pim_sampling_ms, opt.gpu_weight_compute_ms)
+    opt.geopim_attention_ms = opt.parallel_time_ms + opt.gpu_post_process_ms
+    
+    # ========== 数据传输优化 ==========
+    # 原始 GPU 数据流:
+    # 1. 读特征图
+    # 2. 写中间采样结果 (每采样点 C bytes)
+    # 3. 读中间结果做 attention
+    # 4. 写最终结果
+    #
+    # GeoPIM 数据流:
+    # 1. 特征图在 HBM 内部读取
+    # 2. 流式聚合，无中间数据
+    # 3. 只回传最终结果
+    
+    # 中间数据量 = 采样点数 × 通道数 × 2 (FP16)
+    bytes_per_sample = total_c * 2
+    intermediate_data_mb = (sample_count.total_samples * bytes_per_sample) / 1e6
+    
+    # 特征图大小 (估算)
+    feature_map_mb = 2.0  # 约 2MB
+    
+    # 最终结果大小 (Q × C × FP16)
+    num_queries = 4096 * 2  # BEV queries × views
+    final_result_mb = (num_queries * total_c * 2) / 1e6
+    
+    # 数据传输量
+    opt.gpu_data_movement_mb = feature_map_mb + 2 * intermediate_data_mb + final_result_mb
+    opt.geopim_data_movement_mb = feature_map_mb + final_result_mb
+    
+    # 数据传输时间
+    # HBM3 带宽约 900 GB/s，GPU 实际利用率约 38%，GeoPIM 约 70%
+    hbm_bw_gbps = 900
+    gpu_util = 0.38
+    geopim_util = 0.70
+    
+    gpu_transfer_ms = (opt.gpu_data_movement_mb / 1e3) / (hbm_bw_gbps * gpu_util) * 1000
+    geopim_transfer_ms = (opt.geopim_data_movement_mb / 1e3) / (hbm_bw_gbps * geopim_util) * 1000
+    opt.transfer_saving_ms = gpu_transfer_ms - geopim_transfer_ms
+    
+    # ========== 最终计算 ==========
+    # 节省时间 = Attention 优化 + 数据传输优化
+    attention_saving = opt.gpu_attention_time_ms - opt.geopim_attention_ms
+    opt.total_saving_ms = attention_saving + opt.transfer_saving_ms
+    
+    opt.geopim_total_ms = gpu_total_ms - opt.total_saving_ms
+    opt.speedup = gpu_total_ms / opt.geopim_total_ms if opt.geopim_total_ms > 0 else 1.0
+    
+    return opt
 
 
 def _simulate_access_pattern(
@@ -716,6 +839,17 @@ def run_benchmark(
             elif 'Fine Transformer' in stage.name:
                 stage.pim_ms = pim_result.estimated_ms * (fine_time / transformer_module_ms)
     
+    # ========== 计算完整优化模型 ==========
+    cfg = simulator_config or SimulatorConfig()
+    optimization = compute_geopim_optimization(
+        gpu_total_ms=gpu_total,
+        transformer_module_ms=transformer_module_ms,
+        deformable_kernel_ms=deformable_kernel_ms,
+        pim_sampling_ms=pim_result.estimated_ms,
+        sample_count=sample_count,
+        total_c=cfg.total_c,
+    )
+    
     return BenchmarkResult(
         stages=stages,
         kernels=kernels,
@@ -724,7 +858,8 @@ def run_benchmark(
         transformer_module_ms=transformer_module_ms,
         pim_simulation=pim_result,
         sample_count=sample_count,
-        simulator_config=simulator_config or SimulatorConfig(),
+        simulator_config=cfg,
+        optimization=optimization,
     )
 
 
@@ -892,6 +1027,41 @@ def print_results(result: BenchmarkResult):
         print(f"{hr*100:>6.0f}%{marker:<5} {pim_ms:<15.3f} {m_speedup:<15.2f}× {e2e:<12.2f}×")
     print("-" * 120)
     
+    # ========== 完整优化模型 ==========
+    print()
+    print("【完整 GeoPIM 优化模型】")
+    print("-" * 120)
+    opt = result.optimization
+    
+    print()
+    print("  1. PIM-GPU 并行执行:")
+    print(f"     原始 Attention 时间:")
+    print(f"       - Deformable Sampling:  {opt.gpu_deformable_ms:.2f} ms [可 PIM]")
+    print(f"       - 权重计算 (proj等):    {opt.gpu_weight_compute_ms:.2f} ms [GPU]")
+    print(f"       - 后处理:               {opt.gpu_post_process_ms:.2f} ms [GPU]")
+    print(f"       - 总计:                 {opt.gpu_attention_time_ms:.2f} ms")
+    print()
+    print(f"     GeoPIM 并行执行:")
+    print(f"       - PIM 采样:             {opt.pim_sampling_ms:.2f} ms")
+    print(f"       - GPU 权重计算:         {opt.gpu_weight_compute_ms:.2f} ms (与 PIM 并行)")
+    print(f"       - 并行时间:             max({opt.pim_sampling_ms:.2f}, {opt.gpu_weight_compute_ms:.2f}) = {opt.parallel_time_ms:.2f} ms")
+    print(f"       - 后处理:               {opt.gpu_post_process_ms:.2f} ms")
+    print(f"       - 总计:                 {opt.geopim_attention_ms:.2f} ms")
+    
+    print()
+    print("  2. 数据传输优化 (消除中间数据):")
+    print(f"     原始 GPU 数据传输:        {opt.gpu_data_movement_mb:.1f} MB")
+    print(f"     GeoPIM 数据传输:          {opt.geopim_data_movement_mb:.1f} MB")
+    print(f"     传输节省:                 {opt.transfer_saving_ms:.2f} ms")
+    
+    print()
+    print("  3. 总优化效果:")
+    attention_saving = opt.gpu_attention_time_ms - opt.geopim_attention_ms
+    print(f"     Attention 优化节省:       {attention_saving:.2f} ms")
+    print(f"     数据传输节省:             {opt.transfer_saving_ms:.2f} ms")
+    print(f"     总节省:                   {opt.total_saving_ms:.2f} ms")
+    print("-" * 120)
+    
     # ========== 总结 ==========
     print()
     print("=" * 120)
@@ -906,17 +1076,22 @@ def print_results(result: BenchmarkResult):
     
   ▶ PIM 模拟 (Row Hit Rate = {result.pim_simulation.row_hit_rate*100:.1f}%):
     - 采样点数:  {result.sample_count.total_samples:,}
-    - PIM 时间:  {result.pim_simulation.estimated_ms:.3f} ms
+    - PIM 采样:  {result.pim_simulation.estimated_ms:.3f} ms
     - 吞吐量:    {result.pim_simulation.throughput_samples_per_sec/1e6:.2f} M samples/sec
     
-  ▶ 加速比:
-    ┌───────────────────────────────────────────────────┐
-    │ 视角             │ 加速比                         │
-    ├───────────────────────────────────────────────────┤
-    │ Kernel 级别      │ {kernel_speedup:>8.2f}×                        │
-    │ 模块级别         │ {module_speedup:>8.2f}×                        │
-    │ 端到端           │ {e2e_speedup:>8.2f}×                        │
-    └───────────────────────────────────────────────────┘
+  ▶ 加速比对比:
+    ┌──────────────────────────────────────────────────────────────────┐
+    │ 模型                            │ 时间 (ms)    │ 加速比         │
+    ├──────────────────────────────────────────────────────────────────┤
+    │ 原始 GPU                        │ {result.gpu_total_ms:>10.2f}   │ 1.00×          │
+    │ 简单替换 (无并行)               │ {gpu_non_transformer + result.pim_simulation.estimated_ms:>10.2f}   │ {e2e_speedup:>5.2f}×         │
+    │ 完整优化 (并行+传输)            │ {opt.geopim_total_ms:>10.2f}   │ {opt.speedup:>5.2f}×         │
+    └──────────────────────────────────────────────────────────────────┘
+    
+  ▶ 优化来源分解:
+    - PIM-GPU 并行执行:  节省 {attention_saving:.2f} ms
+    - 数据传输消除:      节省 {opt.transfer_saving_ms:.2f} ms
+    - 总计节省:          {opt.total_saving_ms:.2f} ms
 """)
     print("=" * 120)
 
