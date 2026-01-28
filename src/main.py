@@ -2,8 +2,19 @@ import os
 from pathlib import Path
 import warnings
 
-import hydra
+# Suppress deprecation warnings from torchvision and PyTorch Lightning
+warnings.filterwarnings("ignore", message=".*pretrained.*", category=UserWarning)
+warnings.filterwarnings("ignore", message=".*weights.*", category=UserWarning)
+warnings.filterwarnings("ignore", message=".*IterableDataset.*__len__.*", category=UserWarning)
+warnings.filterwarnings("ignore", message=".*dirpath has changed.*", category=UserWarning)
+warnings.filterwarnings("ignore", message=".*torch.meshgrid.*", category=UserWarning)
+
 import torch
+
+# Set precision BEFORE any model loading to avoid Tensor Cores warning
+torch.set_float32_matmul_precision('high')
+
+import hydra
 import wandb
 from colorama import Fore
 from jaxtyping import install_import_hook
@@ -148,7 +159,4 @@ def train(cfg_dict: DictConfig):
 
 
 if __name__ == "__main__":
-    warnings.filterwarnings("ignore")
-    torch.set_float32_matmul_precision('high')
-
     train()

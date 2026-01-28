@@ -3,6 +3,9 @@ __pycache__/
 *.py[cod]
 *$py.class
 mmcv-main/
+depthsplat-main/
+mvsplat-main/
+profile_outputs/
 # C extensions
 *.so
 
@@ -180,4 +183,4 @@ point_clouds*
 assets/*_3views.json
 
 *.pyc
-*.png
+*.pngprofile_outputs/

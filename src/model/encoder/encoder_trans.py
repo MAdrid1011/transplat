@@ -158,42 +158,58 @@ class EncoderTrans(Encoder[EncoderTransCfg]):
         deterministic: bool = False,
         visualization_dump: Optional[dict] = None,
         scene_names: Optional[list] = None,
+        benchmarker = None,  # Add benchmarker parameter for detailed timing
+        analyze_feature_depth: bool = False,  # Feature-depth correlation analysis
     ) -> Gaussians:
         device = context["image"].device
         b, v, _, h, w = context["image"].shape
 
-        intr_curr = context["intrinsics"][:, :, :3, :3].clone().detach()  # [b, v, 3, 3]
-        intr_curr[:, :, 0, :] *= float(w)
-        intr_curr[:, :, 1, :] *= float(h)
-        camk = torch.eye(4).view(1,1,4,4).repeat(intr_curr.shape[0], intr_curr.shape[1], 1, 1).to(intr_curr.device).float()
-        camk[:,:,:3,:3] = intr_curr
-        c2w = context["extrinsics"].clone().detach()
-        camk = torch.inverse(camk)
-        img2world = torch.matmul(c2w, camk)
-        # img2world=None
+        # Helper for conditional benchmarking
+        from contextlib import nullcontext
+        def bench(tag):
+            if benchmarker is not None:
+                return benchmarker.time(tag)
+            return nullcontext()
 
-        trans_features, cnn_features = self.backbone(
-            context["image"],
-            attn_splits=self.cfg.multiview_trans_attn_split,
-            return_cnn_features=True,
-            img2world=img2world,
-        )
+        with bench("encoder_1_prep_intrinsics"):
+            intr_curr = context["intrinsics"][:, :, :3, :3].clone().detach()  # [b, v, 3, 3]
+            intr_curr[:, :, 0, :] *= float(w)
+            intr_curr[:, :, 1, :] *= float(h)
+            camk = torch.eye(4).view(1,1,4,4).repeat(intr_curr.shape[0], intr_curr.shape[1], 1, 1).to(intr_curr.device).float()
+            camk[:,:,:3,:3] = intr_curr
+            c2w = context["extrinsics"].clone().detach()
+            camk = torch.inverse(camk)
+            img2world = torch.matmul(c2w, camk)
+            # img2world=None
 
-        with torch.no_grad():
-            da_images = self.normalize_images(context["image"])
-            da_images = da_images[:,:,[2, 0, 1]]
-            b, v, c, h, w = da_images.shape
-            da_images = da_images.view(b*v, c, h, w)
-            da_images = F.interpolate(da_images, (252, 252), mode="bilinear", align_corners=True)
-            da_depth, out_feature = self.da_model.forward(da_images)
-            da_depth = F.interpolate(da_depth[None], (h, w), mode="bilinear", align_corners=True)
-            da_depth = da_depth.view(b, v, 1, h, w)
-            # normalize to 0 - 1
-            da_depth = da_depth.flatten(2)
-            da_max = torch.max(da_depth, dim=-1, keepdim=True)[0]
-            da_min = torch.min(da_depth, dim=-1, keepdim=True)[0]
-            da_depth = (da_depth - da_min) / (da_max - da_min)
-            da_depth = da_depth.reshape(b, v, 1, h, w)
+        with bench("encoder_2_backbone"):
+            torch.cuda.synchronize()
+            trans_features, cnn_features = self.backbone(
+                context["image"],
+                attn_splits=self.cfg.multiview_trans_attn_split,
+                return_cnn_features=True,
+                img2world=img2world,
+            )
+            torch.cuda.synchronize()
+
+        with bench("encoder_3_depth_anything"):
+            torch.cuda.synchronize()
+            with torch.no_grad():
+                da_images = self.normalize_images(context["image"])
+                da_images = da_images[:,:,[2, 0, 1]]
+                b, v, c, h, w = da_images.shape
+                da_images = da_images.view(b*v, c, h, w)
+                da_images = F.interpolate(da_images, (252, 252), mode="bilinear", align_corners=True)
+                da_depth, out_feature = self.da_model.forward(da_images)
+                da_depth = F.interpolate(da_depth[None], (h, w), mode="bilinear", align_corners=True)
+                da_depth = da_depth.view(b, v, 1, h, w)
+                # normalize to 0 - 1
+                da_depth = da_depth.flatten(2)
+                da_max = torch.max(da_depth, dim=-1, keepdim=True)[0]
+                da_min = torch.min(da_depth, dim=-1, keepdim=True)[0]
+                da_depth = (da_depth - da_min) / (da_max - da_min)
+                da_depth = da_depth.reshape(b, v, 1, h, w)
+            torch.cuda.synchronize()
 
         dino_feature = out_feature.view(b, v, out_feature.shape[1], out_feature.shape[2], out_feature.shape[3])
 
@@ -226,44 +242,67 @@ class EncoderTrans(Encoder[EncoderTransCfg]):
         extra_info['images'] = rearrange(context["image"], "b v c h w -> (v b) c h w")
         extra_info["scene_names"] = scene_names
         gpp = self.cfg.gaussians_per_pixel
-        depths, densities, raw_gaussians = self.depth_predictor(
-            in_feats,
-            context["intrinsics"],
-            context["extrinsics"],
-            context["near"],
-            context["far"],
-            gaussians_per_pixel=gpp,
-            deterministic=deterministic,
-            extra_info=extra_info,
-            cnn_features=cnn_features,
-            da_depth=da_depth,
-            dino_feature=dino_feature,
-        )
+        
+        with bench("encoder_4_depth_predictor"):
+            torch.cuda.synchronize()
+            depths, densities, raw_gaussians = self.depth_predictor(
+                in_feats,
+                context["intrinsics"],
+                context["extrinsics"],
+                context["near"],
+                context["far"],
+                gaussians_per_pixel=gpp,
+                deterministic=deterministic,
+                extra_info=extra_info,
+                cnn_features=cnn_features,
+                da_depth=da_depth,
+                dino_feature=dino_feature,
+                benchmarker=benchmarker,  # Pass benchmarker for sub-stage timing
+            )
+            torch.cuda.synchronize()
+
+        # Feature-depth correlation analysis (if enabled)
+        if analyze_feature_depth:
+            from scripts.analyze_feature_depth_correlation import analyze_and_report
+            # trans_features: [B, V, C, H_feat, W_feat]
+            # depths: [B, V, H*W, srf, dpt] -> reshape to [B, V, H, W]
+            depths_for_analysis = depths[..., 0, 0].view(b, v, h, w)
+            analyze_and_report(trans_features, depths_for_analysis, model_name="transplat")
+
+        # Store intermediate results for redundancy analysis (Challenge 2)
+        # These will be accessed by model_wrapper via getattr
+        self._last_trans_features = trans_features
+        # depth_pdf and depth_candidates are retrieved from depth_predictor if available
+        self._last_depth_pdf = getattr(self.depth_predictor, '_last_pdf', None)
+        self._last_depth_candidates = getattr(self.depth_predictor, '_last_depth_candidates', None)
 
         # Convert the features and depths into Gaussians.
-        xy_ray, _ = sample_image_grid((h, w), device)
-        xy_ray = rearrange(xy_ray, "h w xy -> (h w) () xy")
-        gaussians = rearrange(
-            raw_gaussians,
-            "... (srf c) -> ... srf c",
-            srf=self.cfg.num_surfaces,
-        )
-        offset_xy = gaussians[..., :2].sigmoid()
-        pixel_size = 1 / torch.tensor((w, h), dtype=torch.float32, device=device)
-        xy_ray = xy_ray + (offset_xy - 0.5) * pixel_size
-        gpp = self.cfg.gaussians_per_pixel
-        gaussians = self.gaussian_adapter.forward(
-            rearrange(context["extrinsics"], "b v i j -> b v () () () i j"),
-            rearrange(context["intrinsics"], "b v i j -> b v () () () i j"),
-            rearrange(xy_ray, "b v r srf xy -> b v r srf () xy"),
-            depths,
-            self.map_pdf_to_opacity(densities, global_step) / gpp,
-            rearrange(
-                gaussians[..., 2:],
-                "b v r srf c -> b v r srf () c",
-            ),
-            (h, w),
-        )
+        with bench("encoder_5_gaussian_adapter"):
+            torch.cuda.synchronize()
+            xy_ray, _ = sample_image_grid((h, w), device)
+            xy_ray = rearrange(xy_ray, "h w xy -> (h w) () xy")
+            gaussians = rearrange(
+                raw_gaussians,
+                "... (srf c) -> ... srf c",
+                srf=self.cfg.num_surfaces,
+            )
+            offset_xy = gaussians[..., :2].sigmoid()
+            pixel_size = 1 / torch.tensor((w, h), dtype=torch.float32, device=device)
+            xy_ray = xy_ray + (offset_xy - 0.5) * pixel_size
+            gpp = self.cfg.gaussians_per_pixel
+            gaussians = self.gaussian_adapter.forward(
+                rearrange(context["extrinsics"], "b v i j -> b v () () () i j"),
+                rearrange(context["intrinsics"], "b v i j -> b v () () () i j"),
+                rearrange(xy_ray, "b v r srf xy -> b v r srf () xy"),
+                depths,
+                self.map_pdf_to_opacity(densities, global_step) / gpp,
+                rearrange(
+                    gaussians[..., 2:],
+                    "b v r srf c -> b v r srf () c",
+                ),
+                (h, w),
+            )
+            torch.cuda.synchronize()
 
         # Dump visualizations if needed.
         if visualization_dump is not None:

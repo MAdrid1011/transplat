@@ -57,6 +57,9 @@ test:
   eval_time_skip_steps: 0
   save_image: true
   save_video: false
+  profile_memory: false  # Enable memory allocation profiling per stage
+  profile_hbm_traffic: false  # Enable real HBM traffic profiling per stage
+  analyze_feature_depth: false  # Feature-depth correlation analysis
 
 seed: 111123
 

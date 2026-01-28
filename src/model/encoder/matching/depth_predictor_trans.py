@@ -302,164 +302,192 @@ class DepthPredictorTrans(nn.Module):
         cnn_features=None,
         da_depth=None,
         dino_feature=None,
+        benchmarker=None,  # Add benchmarker for detailed timing
     ):
         """IMPORTANT: this model is in (v b), NOT (b v), due to some historical issues.
         keep this in mind when performing any operation related to the view dim"""
+        # Helper for conditional benchmarking
+        from contextlib import nullcontext
+        def bench(tag):
+            if benchmarker is not None:
+                return benchmarker.time(tag)
+            return nullcontext()
+        
         # format the input
         b, v, c, h, w = features.shape
         dtype = features.dtype
         
-        if da_depth is not None:
-            da_depth = rearrange(da_depth, "b v ... -> (v b) ...")
-        if cnn_features is not None:
-            cnn_features = rearrange(cnn_features, "b v ... -> (v b) ...")
-        if dino_feature is not None:
-            dino_feature = rearrange(dino_feature, "b v ... -> (v b) ...")
-            dino_feature = F.interpolate(
-                dino_feature,
-                size=(64,64),
+        with bench("encoder_4a_prep_features"):
+            if da_depth is not None:
+                da_depth = rearrange(da_depth, "b v ... -> (v b) ...")
+            if cnn_features is not None:
+                cnn_features = rearrange(cnn_features, "b v ... -> (v b) ...")
+            if dino_feature is not None:
+                dino_feature = rearrange(dino_feature, "b v ... -> (v b) ...")
+                dino_feature = F.interpolate(
+                    dino_feature,
+                    size=(64,64),
+                    mode="bilinear",
+                    align_corners=True,
+                )
+            
+            feat_comb_lists, intr_curr, pose_curr_lists, disp_candi_curr = (
+                prepare_feat_proj_data_lists(
+                    features,
+                    intrinsics,
+                    extrinsics,
+                    near,
+                    far,
+                    num_samples=self.num_depth_candidates,
+                )
+            )
+            # cost volume constructions
+            feat01 = feat_comb_lists[0]
+        
+        with bench("encoder_4b_cost_volume_matching"):
+            torch.cuda.synchronize()
+            if v == 2:
+                raw_correlation_in = self.match_two(intr_curr, pose_curr_lists[0], extrinsics, disp_candi_curr, dino_feature, features)
+                raw_correlation_in = torch.cat((raw_correlation_in, feat01), dim=1)
+            elif v == 3:
+                raw_correlation_in_part_list = []
+                for i in range(3):
+                    ind_1 = i
+                    ind_2 = (i + 1) % 3
+                    # pose_curr_lists [0-1,1-2,2-0] [0-2,1-0,2-1]
+                    pose_cur = torch.stack((pose_curr_lists[0][i],pose_curr_lists[1][ind_2]), dim=0)
+                    intr_cur = torch.stack((intr_curr[ind_1],intr_curr[ind_2]), dim=0)
+                    extrinsics_cur = torch.cat((extrinsics[:,ind_1:ind_1+1], extrinsics[:,ind_2:ind_2+1]),dim=1)
+                    disp_candi_cur = torch.stack((disp_candi_curr[ind_1],disp_candi_curr[ind_2]), dim=0)
+                    dino_feature_cur = torch.stack((dino_feature[ind_1],dino_feature[ind_2]), dim=0)
+                    feature_cur = torch.cat((features[:,ind_1:ind_1+1], features[:,ind_2:ind_2+1]),dim=1)
+                    raw_correlation_in_part = self.match_two(intr_cur, pose_cur, extrinsics_cur, disp_candi_cur, dino_feature_cur, feature_cur)
+                    raw_correlation_in_part_list.append(raw_correlation_in_part)
+                raw_correlation_in_list = []
+                for i in range(3):
+                    ind_1 = i
+                    ind_2 = (i + 2) % 3
+                    raw_correlation_in_i = torch.mean(torch.stack((raw_correlation_in_part_list[ind_1][0],raw_correlation_in_part_list[ind_2][1]), dim=0), dim=0)
+                    raw_correlation_in_list.append(raw_correlation_in_i)
+                raw_correlation_in = torch.stack(raw_correlation_in_list, dim=0)
+                raw_correlation_in = torch.cat((raw_correlation_in, feat01), dim=1)
+            elif v == 4:
+                raw_correlation_in_part_list = []
+                for i in range(4):
+                    ind_1 = i
+                    ind_2 = (i + 1) % 4
+                    # pose_curr_lists [0-1,1-2,2-3,3-0] [0-2,1-3,2-0,3-1] [0-3,1-0,2-1,3-2]
+                    pose_cur = torch.stack((pose_curr_lists[0][ind_1],pose_curr_lists[2][ind_2]), dim=0)
+                    intr_cur = torch.stack((intr_curr[ind_1],intr_curr[ind_2]), dim=0)
+                    extrinsics_cur = torch.cat((extrinsics[:,ind_1:ind_1+1], extrinsics[:,ind_2:ind_2+1]),dim=1)
+                    disp_candi_cur = torch.stack((disp_candi_curr[ind_1],disp_candi_curr[ind_2]), dim=0)
+                    dino_feature_cur = torch.stack((dino_feature[ind_1],dino_feature[ind_2]), dim=0)
+                    feature_cur = torch.cat((features[:,ind_1:ind_1+1], features[:,ind_2:ind_2+1]),dim=1)
+                    raw_correlation_in_part = self.match_two(intr_cur, pose_cur, extrinsics_cur, disp_candi_cur, dino_feature_cur, feature_cur)
+                    raw_correlation_in_part_list.append(raw_correlation_in_part)
+                for i in range(2):
+                    ind_1 = i
+                    ind_2 = (i + 2) % 4
+                    # pose_curr_lists [0-1,1-2,2-3,3-0] [0-2,1-3,2-0,3-1] [0-3,1-0,2-1,3-2]
+                    pose_cur = torch.stack((pose_curr_lists[1][ind_1],pose_curr_lists[1][ind_2]), dim=0)
+                    intr_cur = torch.stack((intr_curr[ind_1],intr_curr[ind_2]), dim=0)
+                    extrinsics_cur = torch.cat((extrinsics[:,ind_1:ind_1+1], extrinsics[:,ind_2:ind_2+1]),dim=1)
+                    disp_candi_cur = torch.stack((disp_candi_curr[ind_1],disp_candi_curr[ind_2]), dim=0)
+                    dino_feature_cur = torch.stack((dino_feature[ind_1],dino_feature[ind_2]), dim=0)
+                    feature_cur = torch.cat((features[:,ind_1:ind_1+1], features[:,ind_2:ind_2+1]),dim=1)
+                    raw_correlation_in_part = self.match_two(intr_cur, pose_cur, extrinsics_cur, disp_candi_cur, dino_feature_cur, feature_cur)
+                    raw_correlation_in_part_list.append(raw_correlation_in_part)
+                raw_correlation_in_list = []
+                for i in range(2):
+                    ind_1 = i
+                    ind_2 = (i + 4) % 6
+                    ind_3 = (i + 3) % 4
+                    raw_correlation_in_i = torch.mean(torch.stack((raw_correlation_in_part_list[ind_1][0],raw_correlation_in_part_list[ind_2][0], raw_correlation_in_part_list[ind_3][1]), dim=0), dim=0)
+                    raw_correlation_in_list.append(raw_correlation_in_i)
+                for i in range(2):
+                    ind_1 = i + 2
+                    ind_2 = i + 1
+                    ind_3 = i + 4
+                    raw_correlation_in_i = torch.mean(torch.stack((raw_correlation_in_part_list[ind_1][0],raw_correlation_in_part_list[ind_2][1], raw_correlation_in_part_list[ind_3][1]), dim=0), dim=0)
+                    raw_correlation_in_list.append(raw_correlation_in_i)
+                raw_correlation_in = torch.stack(raw_correlation_in_list, dim=0)
+                raw_correlation_in = torch.cat((raw_correlation_in, feat01), dim=1)
+            torch.cuda.synchronize()
+
+        with bench("encoder_4c_cost_volume_unet"):
+            torch.cuda.synchronize()
+            # refine cost volume via 2D u-net
+            raw_correlation = self.corr_refine_net(raw_correlation_in)  # (vb d h w)
+            # apply skip connection
+            raw_correlation = raw_correlation + self.regressor_residual(raw_correlation_in)
+            torch.cuda.synchronize()
+        
+        with bench("encoder_4d_coarse_depth"):
+            torch.cuda.synchronize()
+            # softmax to get coarse depth and density
+            pdf = F.softmax(
+                self.depth_head_lowres(raw_correlation), dim=1
+            )  # [2xB, D, H, W]
+            coarse_disps = (disp_candi_curr * pdf).sum(
+                dim=1, keepdim=True
+            )  # (vb, 1, h, w)
+            pdf_max = torch.max(pdf, dim=1, keepdim=True)[0]  # argmax
+            pdf_max = F.interpolate(pdf_max, scale_factor=self.upscale_factor)
+            fullres_disps = F.interpolate(
+                coarse_disps,
+                scale_factor=self.upscale_factor,
                 mode="bilinear",
                 align_corners=True,
             )
-        
-        feat_comb_lists, intr_curr, pose_curr_lists, disp_candi_curr = (
-            prepare_feat_proj_data_lists(
-                features,
-                intrinsics,
-                extrinsics,
-                near,
-                far,
-                num_samples=self.num_depth_candidates,
+            torch.cuda.synchronize()
+            
+            # Store PDF and depth candidates for redundancy analysis (Challenge 2)
+            self._last_pdf = pdf  # [VB, D, H, W]
+            self._last_depth_candidates = 1.0 / disp_candi_curr.squeeze()  # depth = 1/disparity
+
+        with bench("encoder_4e_depth_refine_unet"):
+            torch.cuda.synchronize()
+            # depth refinement
+            proj_feat_in_fullres = self.upsampler(torch.cat((feat01, cnn_features), dim=1))
+            proj_feature = self.proj_feature(proj_feat_in_fullres)
+            refine_out = self.refine_unet(torch.cat((extra_info["images"], da_depth, proj_feature, fullres_disps, pdf_max), dim=1))
+            torch.cuda.synchronize()
+
+        with bench("encoder_4f_gaussian_head"):
+            torch.cuda.synchronize()
+            # gaussians head
+            raw_gaussians_in = [refine_out, extra_info["images"], proj_feat_in_fullres]
+            raw_gaussians_in = torch.cat(raw_gaussians_in, dim=1)
+            raw_gaussians = self.to_gaussians(raw_gaussians_in)
+            raw_gaussians = rearrange(
+                raw_gaussians, "(v b) c h w -> b v (h w) c", v=v, b=b
             )
-        )
-        # cost volume constructions
-        feat01 = feat_comb_lists[0]
-        
-        if v == 2:
-            raw_correlation_in = self.match_two(intr_curr, pose_curr_lists[0], extrinsics, disp_candi_curr, dino_feature, features)
-            raw_correlation_in = torch.cat((raw_correlation_in, feat01), dim=1)
-        elif v == 3:
-            raw_correlation_in_part_list = []
-            for i in range(3):
-                ind_1 = i
-                ind_2 = (i + 1) % 3
-                # pose_curr_lists [0-1,1-2,2-0] [0-2,1-0,2-1]
-                pose_cur = torch.stack((pose_curr_lists[0][i],pose_curr_lists[1][ind_2]), dim=0)
-                intr_cur = torch.stack((intr_curr[ind_1],intr_curr[ind_2]), dim=0)
-                extrinsics_cur = torch.cat((extrinsics[:,ind_1:ind_1+1], extrinsics[:,ind_2:ind_2+1]),dim=1)
-                disp_candi_cur = torch.stack((disp_candi_curr[ind_1],disp_candi_curr[ind_2]), dim=0)
-                dino_feature_cur = torch.stack((dino_feature[ind_1],dino_feature[ind_2]), dim=0)
-                feature_cur = torch.cat((features[:,ind_1:ind_1+1], features[:,ind_2:ind_2+1]),dim=1)
-                raw_correlation_in_part = self.match_two(intr_cur, pose_cur, extrinsics_cur, disp_candi_cur, dino_feature_cur, feature_cur)
-                raw_correlation_in_part_list.append(raw_correlation_in_part)
-            raw_correlation_in_list = []
-            for i in range(3):
-                ind_1 = i
-                ind_2 = (i + 2) % 3
-                raw_correlation_in_i = torch.mean(torch.stack((raw_correlation_in_part_list[ind_1][0],raw_correlation_in_part_list[ind_2][1]), dim=0), dim=0)
-                raw_correlation_in_list.append(raw_correlation_in_i)
-            raw_correlation_in = torch.stack(raw_correlation_in_list, dim=0)
-            raw_correlation_in = torch.cat((raw_correlation_in, feat01), dim=1)
-        elif v == 4:
-            raw_correlation_in_part_list = []
-            for i in range(4):
-                ind_1 = i
-                ind_2 = (i + 1) % 4
-                # pose_curr_lists [0-1,1-2,2-3,3-0] [0-2,1-3,2-0,3-1] [0-3,1-0,2-1,3-2]
-                pose_cur = torch.stack((pose_curr_lists[0][ind_1],pose_curr_lists[2][ind_2]), dim=0)
-                intr_cur = torch.stack((intr_curr[ind_1],intr_curr[ind_2]), dim=0)
-                extrinsics_cur = torch.cat((extrinsics[:,ind_1:ind_1+1], extrinsics[:,ind_2:ind_2+1]),dim=1)
-                disp_candi_cur = torch.stack((disp_candi_curr[ind_1],disp_candi_curr[ind_2]), dim=0)
-                dino_feature_cur = torch.stack((dino_feature[ind_1],dino_feature[ind_2]), dim=0)
-                feature_cur = torch.cat((features[:,ind_1:ind_1+1], features[:,ind_2:ind_2+1]),dim=1)
-                raw_correlation_in_part = self.match_two(intr_cur, pose_cur, extrinsics_cur, disp_candi_cur, dino_feature_cur, feature_cur)
-                raw_correlation_in_part_list.append(raw_correlation_in_part)
-            for i in range(2):
-                ind_1 = i
-                ind_2 = (i + 2) % 4
-                # pose_curr_lists [0-1,1-2,2-3,3-0] [0-2,1-3,2-0,3-1] [0-3,1-0,2-1,3-2]
-                pose_cur = torch.stack((pose_curr_lists[1][ind_1],pose_curr_lists[1][ind_2]), dim=0)
-                intr_cur = torch.stack((intr_curr[ind_1],intr_curr[ind_2]), dim=0)
-                extrinsics_cur = torch.cat((extrinsics[:,ind_1:ind_1+1], extrinsics[:,ind_2:ind_2+1]),dim=1)
-                disp_candi_cur = torch.stack((disp_candi_curr[ind_1],disp_candi_curr[ind_2]), dim=0)
-                dino_feature_cur = torch.stack((dino_feature[ind_1],dino_feature[ind_2]), dim=0)
-                feature_cur = torch.cat((features[:,ind_1:ind_1+1], features[:,ind_2:ind_2+1]),dim=1)
-                raw_correlation_in_part = self.match_two(intr_cur, pose_cur, extrinsics_cur, disp_candi_cur, dino_feature_cur, feature_cur)
-                raw_correlation_in_part_list.append(raw_correlation_in_part)
-            raw_correlation_in_list = []
-            for i in range(2):
-                ind_1 = i
-                ind_2 = (i + 4) % 6
-                ind_3 = (i + 3) % 4
-                raw_correlation_in_i = torch.mean(torch.stack((raw_correlation_in_part_list[ind_1][0],raw_correlation_in_part_list[ind_2][0], raw_correlation_in_part_list[ind_3][1]), dim=0), dim=0)
-                raw_correlation_in_list.append(raw_correlation_in_i)
-            for i in range(2):
-                ind_1 = i + 2
-                ind_2 = i + 1
-                ind_3 = i + 4
-                raw_correlation_in_i = torch.mean(torch.stack((raw_correlation_in_part_list[ind_1][0],raw_correlation_in_part_list[ind_2][1], raw_correlation_in_part_list[ind_3][1]), dim=0), dim=0)
-                raw_correlation_in_list.append(raw_correlation_in_i)
-            raw_correlation_in = torch.stack(raw_correlation_in_list, dim=0)
-            raw_correlation_in = torch.cat((raw_correlation_in, feat01), dim=1)
 
-        # refine cost volume via 2D u-net
-        raw_correlation = self.corr_refine_net(raw_correlation_in)  # (vb d h w)
-        # apply skip connection
-        raw_correlation = raw_correlation + self.regressor_residual(raw_correlation_in)
-        
-        # softmax to get coarse depth and density
-        pdf = F.softmax(
-            self.depth_head_lowres(raw_correlation), dim=1
-        )  # [2xB, D, H, W]
-        coarse_disps = (disp_candi_curr * pdf).sum(
-            dim=1, keepdim=True
-        )  # (vb, 1, h, w)
-        pdf_max = torch.max(pdf, dim=1, keepdim=True)[0]  # argmax
-        pdf_max = F.interpolate(pdf_max, scale_factor=self.upscale_factor)
-        fullres_disps = F.interpolate(
-            coarse_disps,
-            scale_factor=self.upscale_factor,
-            mode="bilinear",
-            align_corners=True,
-        )
+            # delta fine depth and density
+            delta_disps_density = self.to_disparity(refine_out)
+            delta_disps, raw_densities = delta_disps_density.split(gaussians_per_pixel, dim=1)
 
-        # depth refinement
-        proj_feat_in_fullres = self.upsampler(torch.cat((feat01, cnn_features), dim=1))
-        proj_feature = self.proj_feature(proj_feat_in_fullres)
-        refine_out = self.refine_unet(torch.cat((extra_info["images"], da_depth, proj_feature, fullres_disps, pdf_max), dim=1))
+            # combine coarse and fine info and match shape
+            densities = repeat(
+                F.sigmoid(raw_densities),
+                "(v b) dpt h w -> b v (h w) srf dpt",
+                b=b,
+                v=v,
+                srf=1,
+            )
 
-        # gaussians head
-        raw_gaussians_in = [refine_out, extra_info["images"], proj_feat_in_fullres]
-        raw_gaussians_in = torch.cat(raw_gaussians_in, dim=1)
-        raw_gaussians = self.to_gaussians(raw_gaussians_in)
-        raw_gaussians = rearrange(
-            raw_gaussians, "(v b) c h w -> b v (h w) c", v=v, b=b
-        )
-
-        # delta fine depth and density
-        delta_disps_density = self.to_disparity(refine_out)
-        delta_disps, raw_densities = delta_disps_density.split(gaussians_per_pixel, dim=1)
-
-        # combine coarse and fine info and match shape
-        densities = repeat(
-            F.sigmoid(raw_densities),
-            "(v b) dpt h w -> b v (h w) srf dpt",
-            b=b,
-            v=v,
-            srf=1,
-        )
-
-        fine_disps = (fullres_disps + delta_disps).clamp(
-            1.0 / rearrange(far, "b v -> (v b) () () ()"),
-            1.0 / rearrange(near, "b v -> (v b) () () ()"),
-        )
-        depths = 1.0 / fine_disps
-        depths = repeat(
-            depths,
-            "(v b) dpt h w -> b v (h w) srf dpt",
-            b=b,
-            v=v,
-            srf=1,
-        )
+            fine_disps = (fullres_disps + delta_disps).clamp(
+                1.0 / rearrange(far, "b v -> (v b) () () ()"),
+                1.0 / rearrange(near, "b v -> (v b) () () ()"),
+            )
+            depths = 1.0 / fine_disps
+            depths = repeat(
+                depths,
+                "(v b) dpt h w -> b v (h w) srf dpt",
+                b=b,
+                v=v,
+                srf=1,
+            )
+            torch.cuda.synchronize()
 
         return depths, densities, raw_gaussians
