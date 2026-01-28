@@ -1,3 +1,4 @@
+from dataclasses import dataclass
 from math import isqrt
 from typing import Literal
 
@@ -229,6 +230,146 @@ def render_cuda_orthographic(
 
 
 DepthRenderingMode = Literal["depth", "disparity", "relative_disparity", "log"]
+
+
+@dataclass
+class GaussianContributionStats:
+    """高斯基元贡献统计结果"""
+    total_gaussians: int                      # 总高斯基元数量
+    visible_gaussians: int                    # 可见高斯数量 (radii > 0)
+    high_contribution_gaussians: int          # 高贡献高斯数量
+    visible_ratio: float                      # 可见比例
+    high_contribution_ratio: float            # 高贡献比例
+    opacity_threshold: float                  # 使用的透明度阈值
+    radii: Float[Tensor, "gaussian"] = None   # 每个高斯的渲染半径
+    
+    def __repr__(self):
+        return (
+            f"GaussianContributionStats(\n"
+            f"  total={self.total_gaussians:,}, visible={self.visible_gaussians:,} ({self.visible_ratio*100:.2f}%), "
+            f"high_contrib={self.high_contribution_gaussians:,} ({self.high_contribution_ratio*100:.2f}%)\n"
+            f"  opacity_threshold={self.opacity_threshold:.3f}\n"
+            f")"
+        )
+
+
+def render_cuda_with_stats(
+    extrinsics: Float[Tensor, "batch 4 4"],
+    intrinsics: Float[Tensor, "batch 3 3"],
+    near: Float[Tensor, " batch"],
+    far: Float[Tensor, " batch"],
+    image_shape: tuple[int, int],
+    background_color: Float[Tensor, "batch 3"],
+    gaussian_means: Float[Tensor, "batch gaussian 3"],
+    gaussian_covariances: Float[Tensor, "batch gaussian 3 3"],
+    gaussian_sh_coefficients: Float[Tensor, "batch gaussian 3 d_sh"],
+    gaussian_opacities: Float[Tensor, "batch gaussian"],
+    scale_invariant: bool = True,
+    use_sh: bool = True,
+    opacity_threshold: float = 0.01,  # 高贡献的透明度阈值
+) -> tuple[Float[Tensor, "batch 3 height width"], list[GaussianContributionStats]]:
+    """
+    渲染高斯并返回高斯基元贡献统计信息
+    
+    Args:
+        opacity_threshold: 认为是"高贡献"的最小透明度值
+    
+    Returns:
+        images: 渲染的图像
+        stats_list: 每个 batch 的高斯贡献统计
+    """
+    assert use_sh or gaussian_sh_coefficients.shape[-1] == 1
+
+    # Make sure everything is in a range where numerical issues don't appear.
+    original_opacities = gaussian_opacities.clone()  # 保存原始 opacity 用于统计
+    
+    if scale_invariant:
+        scale = 1 / near
+        extrinsics = extrinsics.clone()
+        extrinsics[..., :3, 3] = extrinsics[..., :3, 3] * scale[:, None]
+        gaussian_covariances = gaussian_covariances * (scale[:, None, None, None] ** 2)
+        gaussian_means = gaussian_means * scale[:, None, None]
+        near = near * scale
+        far = far * scale
+
+    _, _, _, n = gaussian_sh_coefficients.shape
+    degree = isqrt(n) - 1
+    shs = rearrange(gaussian_sh_coefficients, "b g xyz n -> b g n xyz").contiguous()
+
+    b, _, _ = extrinsics.shape
+    h, w = image_shape
+
+    fov_x, fov_y = get_fov(intrinsics).unbind(dim=-1)
+    tan_fov_x = (0.5 * fov_x).tan()
+    tan_fov_y = (0.5 * fov_y).tan()
+
+    projection_matrix = get_projection_matrix(near, far, fov_x, fov_y)
+    projection_matrix = rearrange(projection_matrix, "b i j -> b j i")
+    view_matrix = rearrange(extrinsics.inverse(), "b i j -> b j i")
+    full_projection = view_matrix @ projection_matrix
+
+    all_images = []
+    all_radii = []
+    all_stats = []
+    
+    for i in range(b):
+        # Set up a tensor for the gradients of the screen-space means.
+        mean_gradients = torch.zeros_like(gaussian_means[i], requires_grad=True)
+        try:
+            mean_gradients.retain_grad()
+        except Exception:
+            pass
+
+        settings = GaussianRasterizationSettings(
+            image_height=h,
+            image_width=w,
+            tanfovx=tan_fov_x[i].item(),
+            tanfovy=tan_fov_y[i].item(),
+            bg=background_color[i],
+            scale_modifier=1.0,
+            viewmatrix=view_matrix[i],
+            projmatrix=full_projection[i],
+            sh_degree=degree,
+            campos=extrinsics[i, :3, 3],
+            prefiltered=False,
+            debug=False,
+        )
+        rasterizer = GaussianRasterizer(settings)
+
+        row, col = torch.triu_indices(3, 3)
+
+        image, radii = rasterizer(
+            means3D=gaussian_means[i],
+            means2D=mean_gradients,
+            shs=shs[i] if use_sh else None,
+            colors_precomp=None if use_sh else shs[i, :, 0, :],
+            opacities=gaussian_opacities[i, ..., None],
+            cov3D_precomp=gaussian_covariances[i, :, row, col],
+        )
+        all_images.append(image)
+        all_radii.append(radii)
+        
+        # 计算统计信息
+        total_gaussians = radii.shape[0]
+        visible_mask = radii > 0  # radii > 0 表示该高斯被渲染
+        visible_gaussians = visible_mask.sum().item()
+        
+        # 高贡献高斯: 可见 + opacity 超过阈值
+        high_contrib_mask = visible_mask & (original_opacities[i] >= opacity_threshold)
+        high_contribution_gaussians = high_contrib_mask.sum().item()
+        
+        stats = GaussianContributionStats(
+            total_gaussians=total_gaussians,
+            visible_gaussians=visible_gaussians,
+            high_contribution_gaussians=high_contribution_gaussians,
+            visible_ratio=visible_gaussians / total_gaussians if total_gaussians > 0 else 0.0,
+            high_contribution_ratio=high_contribution_gaussians / total_gaussians if total_gaussians > 0 else 0.0,
+            opacity_threshold=opacity_threshold,
+            radii=radii.clone(),
+        )
+        all_stats.append(stats)
+        
+    return torch.stack(all_images), all_stats
 
 
 def render_depth_cuda(

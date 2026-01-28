@@ -8,7 +8,13 @@ from torch import Tensor
 
 from ...dataset import DatasetCfg
 from ..types import Gaussians
-from .cuda_splatting import DepthRenderingMode, render_cuda, render_depth_cuda
+from .cuda_splatting import (
+    DepthRenderingMode, 
+    render_cuda, 
+    render_depth_cuda,
+    render_cuda_with_stats,
+    GaussianContributionStats,
+)
 from .decoder import Decoder, DecoderOutput
 
 
@@ -89,3 +95,52 @@ class DecoderSplattingCUDA(Decoder[DecoderSplattingCUDACfg]):
             mode=mode,
         )
         return rearrange(result, "(b v) h w -> b v h w", b=b, v=v)
+
+    def forward_with_gaussian_stats(
+        self,
+        gaussians: Gaussians,
+        extrinsics: Float[Tensor, "batch view 4 4"],
+        intrinsics: Float[Tensor, "batch view 3 3"],
+        near: Float[Tensor, "batch view"],
+        far: Float[Tensor, "batch view"],
+        image_shape: tuple[int, int],
+        depth_mode: DepthRenderingMode | None = None,
+        opacity_threshold: float = 0.01,
+    ) -> tuple[DecoderOutput, list[GaussianContributionStats]]:
+        """
+        渲染高斯并返回高斯基元贡献统计
+        
+        Args:
+            opacity_threshold: 认为是"高贡献"的最小透明度值
+            
+        Returns:
+            output: 渲染输出
+            stats: 每个视角的高斯贡献统计列表
+        """
+        b, v, _, _ = extrinsics.shape
+        
+        color, stats_list = render_cuda_with_stats(
+            rearrange(extrinsics, "b v i j -> (b v) i j"),
+            rearrange(intrinsics, "b v i j -> (b v) i j"),
+            rearrange(near, "b v -> (b v)"),
+            rearrange(far, "b v -> (b v)"),
+            image_shape,
+            repeat(self.background_color, "c -> (b v) c", b=b, v=v),
+            repeat(gaussians.means, "b g xyz -> (b v) g xyz", v=v),
+            repeat(gaussians.covariances, "b g i j -> (b v) g i j", v=v),
+            repeat(gaussians.harmonics, "b g c d_sh -> (b v) g c d_sh", v=v),
+            repeat(gaussians.opacities, "b g -> (b v) g", v=v),
+            opacity_threshold=opacity_threshold,
+        )
+        color = rearrange(color, "(b v) c h w -> b v c h w", b=b, v=v)
+
+        output = DecoderOutput(
+            color,
+            None
+            if depth_mode is None
+            else self.render_depth(
+                gaussians, extrinsics, intrinsics, near, far, image_shape, depth_mode
+            ),
+        )
+        
+        return output, stats_list

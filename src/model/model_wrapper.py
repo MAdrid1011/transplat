@@ -56,6 +56,12 @@ class TestCfg:
     save_image: bool
     save_video: bool
     eval_time_skip_steps: int
+    profile_memory: bool = False  # Enable memory allocation profiling
+    profile_hbm_traffic: bool = False  # Enable real HBM traffic profiling
+    analyze_feature_depth: bool = False  # Feature-depth correlation analysis
+    analyze_gaussian_redundancy: bool = False  # Gaussian redundancy analysis (Challenge 2)
+    analyze_adjacent_gaussians: bool = False  # Adjacent Gaussian similarity analysis
+    analyze_gaussian_smoothness: bool = False  # Gaussian smoothness/variability analysis
 
 
 @dataclass
@@ -181,12 +187,24 @@ class ModelWrapper(LightningModule):
         b, v, _, h, w = batch["target"]["image"].shape
         assert b == 1
 
-        # Render Gaussians.
+        # Enable memory profiling if configured
+        if batch_idx == 0 and self.test_cfg.profile_memory:
+            self.benchmarker.enable_memory_profiling(True)
+            print("\n[Memory Allocation Profiling Enabled]")
+        
+        # Enable HBM traffic profiling if configured
+        if batch_idx == 0 and self.test_cfg.profile_hbm_traffic:
+            self.benchmarker.enable_hbm_traffic_profiling(True)
+            print("\n[HBM Traffic Profiling Enabled]")
+
+        # Render Gaussians with detailed timing
         with self.benchmarker.time("encoder"):
             gaussians = self.encoder(
                 batch["context"],
                 self.global_step,
                 deterministic=False,
+                benchmarker=self.benchmarker,  # Pass benchmarker for detailed timing
+                analyze_feature_depth=self.test_cfg.analyze_feature_depth,  # Feature-depth analysis
             )
         with self.benchmarker.time("decoder", num_calls=v):
             output = self.decoder.forward(
@@ -200,6 +218,54 @@ class ModelWrapper(LightningModule):
             )
 
         (scene,) = batch["scene"]
+        
+        # Gaussian redundancy analysis (Challenge 2)
+        if self.test_cfg.analyze_gaussian_redundancy:
+            try:
+                from scripts.analyze_gaussian_redundancy import get_analyzer
+                analyzer = get_analyzer()
+                
+                # Get features and depth_pdf from encoder if available
+                features = getattr(self.encoder, '_last_trans_features', None)
+                depth_pdf = getattr(self.encoder, '_last_depth_pdf', None)
+                depth_candidates = getattr(self.encoder, '_last_depth_candidates', None)
+                
+                stats = analyzer.analyze_scene(
+                    scene_name=scene,
+                    gaussians=gaussians,
+                    target_extrinsics=batch["target"]["extrinsics"],
+                    target_intrinsics=batch["target"]["intrinsics"],
+                    near=batch["target"]["near"],
+                    far=batch["target"]["far"],
+                    image_shape=(h, w),
+                    features=features,
+                    depth_pdf=depth_pdf,
+                    depth_candidates=depth_candidates,
+                )
+                analyzer.print_scene_report(stats)
+            except Exception as e:
+                print(f"[Warning] Gaussian redundancy analysis failed: {e}")
+        
+        # Adjacent Gaussian similarity analysis
+        if self.test_cfg.analyze_adjacent_gaussians:
+            try:
+                from scripts.analyze_adjacent_gaussians import get_adjacent_analyzer
+                adj_analyzer = get_adjacent_analyzer()
+                adj_stats = adj_analyzer.analyze_scene(scene, gaussians)
+                adj_analyzer.print_scene_report(adj_stats)
+            except Exception as e:
+                print(f"[Warning] Adjacent Gaussian analysis failed: {e}")
+        
+        # Gaussian smoothness/variability analysis
+        if self.test_cfg.analyze_gaussian_smoothness:
+            try:
+                from scripts.analyze_gaussian_smoothness import get_smoothness_analyzer
+                smooth_analyzer = get_smoothness_analyzer()
+                smooth_stats = smooth_analyzer.analyze_scene(scene, gaussians)
+                smooth_analyzer.print_scene_report(smooth_stats)
+            except Exception as e:
+                print(f"[Warning] Gaussian smoothness analysis failed: {e}")
+        
         name = get_cfg()["wandb"]["name"]
         path = self.test_cfg.output_path / name
         images_prob = output.color[0]
@@ -267,12 +333,180 @@ class ModelWrapper(LightningModule):
                         json.dump(metric_scores, f)
                     metric_scores.clear()
 
+            # Print detailed timing statistics
+            print("\n" + "="*60)
+            print("DETAILED TIMING STATISTICS")
+            print("="*60)
+            
+            # Collect all timing data (no skip for detailed analysis)
+            timing_data = {}
             for tag, times in self.benchmarker.execution_times.items():
-                times = times[int(self.time_skip_steps_dict[tag]) :]
-                saved_scores[tag] = [len(times), np.mean(times)]
-                print(
-                    f"{tag}: {len(times)} calls, avg. {np.mean(times)} seconds per call"
-                )
+                if len(times) > 0:
+                    total = sum(times)
+                    timing_data[tag] = {
+                        'calls': len(times),
+                        'total': total,
+                        'avg': np.mean(times),
+                        'std': np.std(times) if len(times) > 1 else 0,
+                    }
+            
+            # Calculate encoder total time from sub-stages if 'encoder' not available
+            encoder_total = 0
+            if 'encoder' in timing_data:
+                encoder_total = timing_data['encoder']['total']
+            else:
+                # Sum up encoder sub-stages
+                for tag, data in timing_data.items():
+                    if tag.startswith('encoder_') and not tag.startswith('encoder_4'):
+                        encoder_total += data['total']
+                    elif tag == 'encoder_4_depth_predictor':
+                        encoder_total += data['total']
+            
+            # Get decoder total
+            decoder_total = timing_data.get('decoder', {}).get('total', 0)
+            
+            # Total inference time
+            total_time = encoder_total + decoder_total
+            
+            # Define the order for printing
+            stage_order = [
+                'encoder',
+                'encoder_1_prep_intrinsics',
+                'encoder_2_backbone', 
+                'encoder_3_depth_anything',
+                'encoder_4_depth_predictor',
+                'encoder_4a_prep_features',
+                'encoder_4b_cost_volume_matching',
+                'encoder_4c_cost_volume_unet',
+                'encoder_4d_coarse_depth',
+                'encoder_4e_depth_refine_unet',
+                'encoder_4f_gaussian_head',
+                'encoder_5_gaussian_adapter',
+                'decoder',
+            ]
+            
+            # Print timing for each stage in order
+            print(f"\n{'Stage':<35} {'Calls':>6} {'Avg(ms)':>10} {'Total(s)':>10} {'% of Total':>12} {'% of Encoder':>14}")
+            print("-" * 90)
+            
+            for tag in stage_order:
+                if tag not in timing_data:
+                    continue
+                data = timing_data[tag]
+                
+                # Calculate percentages
+                pct_total = (data['total'] / total_time * 100) if total_time > 0 else 0
+                
+                if tag.startswith('encoder_') and encoder_total > 0:
+                    pct_encoder = (data['total'] / encoder_total * 100)
+                    pct_encoder_str = f"{pct_encoder:>12.1f}%"
+                else:
+                    pct_encoder_str = f"{'--':>13}"
+                
+                print(f"{tag:<35} {data['calls']:>6} {data['avg']*1000:>10.2f} {data['total']:>10.3f} {pct_total:>11.1f}% {pct_encoder_str}")
+                
+                saved_scores[tag] = [data['calls'], data['avg']]
+            
+            print("-" * 90)
+            print(f"{'ENCODER TOTAL':<35} {'':>6} {'':>10} {encoder_total:>10.3f} {(encoder_total/total_time*100 if total_time > 0 else 0):>11.1f}%")
+            print(f"{'DECODER TOTAL':<35} {'':>6} {'':>10} {decoder_total:>10.3f} {(decoder_total/total_time*100 if total_time > 0 else 0):>11.1f}%")
+            print("="*90)
+            print(f"{'TOTAL INFERENCE TIME':<35} {'':>6} {'':>10} {total_time:>10.3f}s")
+            print("="*90 + "\n")
+            
+            # Print feature-depth correlation analysis if enabled
+            if self.test_cfg.analyze_feature_depth:
+                from scripts.analyze_feature_depth_correlation import print_final_report
+                print_final_report("transplat")
+            
+            # Print Gaussian redundancy analysis if enabled (Challenge 2)
+            if self.test_cfg.analyze_gaussian_redundancy:
+                from scripts.analyze_gaussian_redundancy import get_analyzer
+                analyzer = get_analyzer()
+                analyzer.print_summary_report("transplat")
+            
+            # Print adjacent Gaussian similarity analysis if enabled
+            if self.test_cfg.analyze_adjacent_gaussians:
+                from scripts.analyze_adjacent_gaussians import get_adjacent_analyzer
+                adj_analyzer = get_adjacent_analyzer()
+                adj_analyzer.print_summary_report("transplat")
+            
+            # Print Gaussian smoothness analysis if enabled
+            if self.test_cfg.analyze_gaussian_smoothness:
+                from scripts.analyze_gaussian_smoothness import get_smoothness_analyzer
+                smooth_analyzer = get_smoothness_analyzer()
+                smooth_analyzer.print_summary_report("transplat")
+            
+            # Print memory statistics if profiling was enabled
+            if self.test_cfg.profile_memory and self.benchmarker.memory_stats:
+                print("\n" + "="*80)
+                print("HBM MEMORY STATISTICS (per stage)")
+                print("="*80)
+                
+                memory_summary = self.benchmarker.get_memory_summary()
+                
+                # Calculate total memory usage
+                total_peak_mb = sum(s['avg_peak_mb'] for s in memory_summary.values())
+                
+                print(f"\n{'Stage':<40} {'Peak (MB)':>12} {'Delta (MB)':>12} {'% of Total':>12}")
+                print("-" * 76)
+                
+                for tag in stage_order:
+                    if tag in memory_summary:
+                        stats = memory_summary[tag]
+                        pct = (stats['avg_peak_mb'] / total_peak_mb * 100) if total_peak_mb > 0 else 0
+                        print(f"{tag:<40} {stats['avg_peak_mb']:>12.2f} {stats['avg_delta_mb']:>12.2f} {pct:>11.1f}%")
+                
+                # Print any other stages not in order
+                for tag in sorted(memory_summary.keys()):
+                    if tag not in stage_order:
+                        stats = memory_summary[tag]
+                        pct = (stats['avg_peak_mb'] / total_peak_mb * 100) if total_peak_mb > 0 else 0
+                        print(f"{tag:<40} {stats['avg_peak_mb']:>12.2f} {stats['avg_delta_mb']:>12.2f} {pct:>11.1f}%")
+                
+                print("-" * 76)
+                print(f"{'TOTAL PEAK MEMORY':<40} {total_peak_mb:>12.2f} MB")
+                print("="*80 + "\n")
+                
+                # Dump memory stats to file
+                self.benchmarker.dump_memory_stats(out_dir / "memory_stats.json")
+            
+            # Print HBM traffic statistics if profiling was enabled
+            if self.test_cfg.profile_hbm_traffic and self.benchmarker.hbm_traffic_stats:
+                print("\n" + "="*90)
+                print("HBM TRAFFIC STATISTICS (Real CUDA Memory Operations)")
+                print("="*90)
+                
+                hbm_summary = self.benchmarker.get_hbm_traffic_summary()
+                
+                # Calculate total traffic
+                total_traffic_mb = sum(s['avg_cuda_mem_mb'] for s in hbm_summary.values())
+                
+                print(f"\n{'Stage':<40} {'Traffic (MB)':>14} {'CUDA Time (ms)':>16} {'Kernels':>10} {'% of Total':>12}")
+                print("-" * 92)
+                
+                for tag in stage_order:
+                    if tag in hbm_summary:
+                        stats = hbm_summary[tag]
+                        pct = (stats['avg_cuda_mem_mb'] / total_traffic_mb * 100) if total_traffic_mb > 0 else 0
+                        print(f"{tag:<40} {stats['avg_cuda_mem_mb']:>14.2f} {stats['avg_cuda_time_ms']:>16.2f} {stats['avg_kernel_count']:>10.0f} {pct:>11.1f}%")
+                
+                # Print any other stages not in order
+                for tag in sorted(hbm_summary.keys()):
+                    if tag not in stage_order:
+                        stats = hbm_summary[tag]
+                        pct = (stats['avg_cuda_mem_mb'] / total_traffic_mb * 100) if total_traffic_mb > 0 else 0
+                        print(f"{tag:<40} {stats['avg_cuda_mem_mb']:>14.2f} {stats['avg_cuda_time_ms']:>16.2f} {stats['avg_kernel_count']:>10.0f} {pct:>11.1f}%")
+                
+                print("-" * 92)
+                print(f"{'TOTAL HBM TRAFFIC':<40} {total_traffic_mb:>14.2f} MB")
+                print("="*90 + "\n")
+                
+                # Dump HBM traffic stats to file
+                self.benchmarker.dump_hbm_traffic_stats(out_dir / "hbm_traffic_stats.json")
+            
+            # Reset skip dict
+            for tag in self.time_skip_steps_dict:
                 self.time_skip_steps_dict[tag] = 0
 
             with (out_dir / f"scores_all_avg.json").open("w") as f:
