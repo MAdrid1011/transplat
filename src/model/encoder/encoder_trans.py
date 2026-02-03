@@ -25,6 +25,18 @@ from ...global_cfg import get_cfg
 
 from ...depth_anything_v2.dpt import DepthAnythingV2
 
+# SAES integration
+try:
+    import sys
+    from pathlib import Path
+    scarf_path = Path(__file__).parents[4] / "SCARF"
+    if scarf_path.exists():
+        sys.path.insert(0, str(scarf_path))
+    from saes import TileProcessor, TileConfig
+    SAES_AVAILABLE = True
+except ImportError:
+    SAES_AVAILABLE = False
+
 @dataclass
 class OpacityMappingCfg:
     initial: float
@@ -160,6 +172,8 @@ class EncoderTrans(Encoder[EncoderTransCfg]):
         scene_names: Optional[list] = None,
         benchmarker = None,  # Add benchmarker parameter for detailed timing
         analyze_feature_depth: bool = False,  # Feature-depth correlation analysis
+        enable_saes: bool = False,  # SAES simulation flag
+        saes_config: Optional['TileConfig'] = None,  # SAES configuration
     ) -> Gaussians:
         device = context["image"].device
         b, v, _, h, w = context["image"].shape
