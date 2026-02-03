@@ -261,7 +261,16 @@ class ModelWrapper(LightningModule):
             try:
                 from scripts.analyze_gaussian_smoothness import get_smoothness_analyzer
                 smooth_analyzer = get_smoothness_analyzer()
-                smooth_stats = smooth_analyzer.analyze_scene(scene, gaussians)
+                smooth_stats = smooth_analyzer.analyze_scene(
+                    scene_name=scene,
+                    gaussians=gaussians,
+                    context_images=batch["context"]["image"],
+                    context_extrinsics=batch["context"]["extrinsics"],
+                    context_intrinsics=batch["context"]["intrinsics"],
+                    target_images=batch["target"]["image"],
+                    target_extrinsics=batch["target"]["extrinsics"],
+                    target_intrinsics=batch["target"]["intrinsics"],
+                )
                 smooth_analyzer.print_scene_report(smooth_stats)
             except Exception as e:
                 print(f"[Warning] Gaussian smoothness analysis failed: {e}")

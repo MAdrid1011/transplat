@@ -293,7 +293,14 @@ run_mvsplat() {
         return
     fi
     
-    PYTHON_CMD="python -m src.main +experiment=re10k mode=test dataset/view_sampler=evaluation test.compute_scores=true dataset.test_len=1 test.eval_time_skip_steps=0 checkpointing.load=checkpoints/re10k.ckpt $MEMORY_FLAG $ANALYZE_FD_FLAG $ANALYZE_REDUNDANCY_FLAG"
+    # Check if Gaussian smoothness analysis is enabled
+    ANALYZE_SMOOTHNESS_FLAG=""
+    if [ "$ANALYZE_SMOOTHNESS" = "true" ]; then
+        ANALYZE_SMOOTHNESS_FLAG="+test.analyze_gaussian_smoothness=true"
+        echo "[Gaussian Smoothness/Variability Analysis Enabled]"
+    fi
+    
+    PYTHON_CMD="python -m src.main +experiment=re10k mode=test dataset/view_sampler=evaluation test.compute_scores=true dataset.test_len=1 test.eval_time_skip_steps=0 checkpointing.load=checkpoints/re10k.ckpt $MEMORY_FLAG $ANALYZE_FD_FLAG $ANALYZE_REDUNDANCY_FLAG $ANALYZE_SMOOTHNESS_FLAG"
     
     if [ "$PROFILE_HBM_TRAFFIC" = "true" ]; then
         echo "[HBM Traffic Profiling Enabled via nsys]"
@@ -397,7 +404,14 @@ run_depthsplat() {
         return
     fi
     
-    PYTHON_CMD="python -m src.main +experiment=re10k dataset.test_chunk_interval=1 model.encoder.upsample_factor=4 model.encoder.lowest_feature_resolution=4 checkpointing.pretrained_model=checkpoints/depthsplat-gs-small-re10k-256x256-view2-cfeab6b1.pth mode=test dataset/view_sampler=evaluation dataset.test_len=1 test.eval_time_skip_steps=0 $MEMORY_FLAG $ANALYZE_FD_FLAG $ANALYZE_REDUNDANCY_FLAG"
+    # Check if Gaussian smoothness analysis is enabled
+    ANALYZE_SMOOTHNESS_FLAG=""
+    if [ "$ANALYZE_SMOOTHNESS" = "true" ]; then
+        ANALYZE_SMOOTHNESS_FLAG="+test.analyze_gaussian_smoothness=true"
+        echo "[Gaussian Smoothness/Variability Analysis Enabled]"
+    fi
+    
+    PYTHON_CMD="python -m src.main +experiment=re10k dataset.test_chunk_interval=1 model.encoder.upsample_factor=4 model.encoder.lowest_feature_resolution=4 checkpointing.pretrained_model=checkpoints/depthsplat-gs-small-re10k-256x256-view2-cfeab6b1.pth mode=test dataset/view_sampler=evaluation dataset.test_len=1 test.eval_time_skip_steps=0 $MEMORY_FLAG $ANALYZE_FD_FLAG $ANALYZE_REDUNDANCY_FLAG $ANALYZE_SMOOTHNESS_FLAG"
     
     if [ "$PROFILE_HBM_TRAFFIC" = "true" ]; then
         echo "[HBM Traffic Profiling Enabled via nsys]"
